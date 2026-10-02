@@ -15,6 +15,7 @@
     "slave_ids": [1, 2]
   },
   "roles": {},
+  "device_modes": {},
   "fluid_profiles": {
     "DEVICE_SERIAL": {
       "0": {

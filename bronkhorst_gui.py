@@ -1,7 +1,7 @@
 """Automatic Bronkhorst EL-FLOW Prestige discovery and experiment runner.
 
-Discovery only uses ProPar reads. Setpoints are written only after the operator
-enables control and starts a validated plan.
+Discovery only uses ProPar reads. With control enabled, the operator can start
+a validated plan or send manual setpoints from individual MFC cards.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ FLUIDSET_INDEX, FLUID_NAME = 24, 25
 INLET_PRESSURE, OUTLET_PRESSURE, FLUID_TEMPERATURE = 178, 179, 181
 REFERENCE_PRESSURE = 246
 ROLES = ("Unassigned", "H2", "Alkene", "Other")
+MFC_MODES = ("Read flow", "Set flow")
 
 # A busy COM port is an expected state during discovery (for example when
 # FlowSuite is open). It is reported in the GUI rather than printed repeatedly.
@@ -52,6 +53,7 @@ class DeviceInfo:
     outlet_pressure_bar_a: float | None = None
     fluid_temperature_c: float | None = None
     reference_pressure_bar_a: float | None = None
+    setpoint_flow: float | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +135,11 @@ class ConfigStore:
         if not 0.5 <= self.discovery["scan_interval_s"] <= 120 or not 0.02 <= self.discovery["probe_timeout_s"] <= 5:
             raise ValueError("Invalid discovery timing")
         self.roles = {str(serial): str(role) for serial, role in self.raw.get("roles", {}).items() if str(role) in ROLES}
+        self.device_modes = {
+            str(serial): str(mode)
+            for serial, mode in self.raw.get("device_modes", {}).items()
+            if str(mode) in MFC_MODES
+        }
         raw_profiles = self.raw.get("fluid_profiles", {})
         self.fluid_profiles: dict[str, dict[str, dict[str, Any]]] = {
             str(serial): {str(slot): dict(profile) for slot, profile in slots.items() if isinstance(profile, dict)}
@@ -143,6 +150,11 @@ class ConfigStore:
         self.raw["roles"] = roles
         self.path.write_text(json.dumps(self.raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         self.roles = dict(roles)
+
+    def save_device_modes(self, device_modes: dict[str, str]) -> None:
+        self.raw["device_modes"] = device_modes
+        self.path.write_text(json.dumps(self.raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        self.device_modes = dict(device_modes)
 
     def save_fluid_profile(self, serial_number: str, fluidset_index: int, profile: dict[str, Any]) -> None:
         self.fluid_profiles.setdefault(serial_number, {})[str(fluidset_index)] = dict(profile)
@@ -229,7 +241,15 @@ class SerialService(threading.Thread):
         return DeviceInfo(
             serial_number, model or "EL-FLOW Prestige", port, 0x80, capacity, unit, measured,
             fluid_name, fluidset_index, inlet, outlet, temperature, reference,
+            setpoint_flow=self._optional_flow(client, FSETPOINT),
         )
+
+    def _optional_flow(self, client: propar.instrument, parameter: int) -> float | None:
+        try:
+            value = float(self._read(client, parameter, "flow readback"))
+            return value if math.isfinite(value) else None
+        except Exception:
+            return None
 
     def _candidate_ports(self) -> list[str]:
         return sorted(self.connected_ports)
@@ -307,12 +327,14 @@ class SerialService(threading.Thread):
                 self.port_failures.pop(port, None)
                 if device.serial_number not in self.devices:
                     self._log(f"{port}: identification reply — serial {device.serial_number}, gas {device.fluid_name}.")
-            except Exception:
+            except Exception as exc:
                 failures = self.port_failures.get(port, 0) + 1
                 self.port_failures[port] = failures
+                if failures == 1:
+                    self._log(f"{port}: ProPar identification failed — {type(exc).__name__}: {exc}")
                 for serial_number, old_device in list(found.items()):
                     if old_device.port == port:
-                        found[serial_number] = replace(old_device, measured_flow=None)
+                        found[serial_number] = replace(old_device, measured_flow=None, setpoint_flow=None)
                 # Recreate the serial object only after repeated failures.
                 if failures >= 3:
                     self._log(f"{port}: {failures} identification failures; recreating the ProPar session.")
@@ -328,10 +350,12 @@ class SerialService(threading.Thread):
         refreshed: dict[str, DeviceInfo] = {}
         for serial_number, device in self.devices.items():
             try:
-                flow = float(self._read(self._client(device.port, self.serial["timeout_s"]), FMEASURE, "poll"))
-                refreshed[serial_number] = replace(device, measured_flow=flow)
+                client = self._client(device.port, self.serial["timeout_s"])
+                flow = self._optional_flow(client, FMEASURE)
+                setpoint = self._optional_flow(client, FSETPOINT)
+                refreshed[serial_number] = replace(device, measured_flow=flow, setpoint_flow=setpoint)
             except Exception:
-                refreshed[serial_number] = replace(device, measured_flow=None)
+                refreshed[serial_number] = replace(device, measured_flow=None, setpoint_flow=None)
         self.devices = refreshed
         self.events.put(("devices", list(refreshed.values())))
 
@@ -380,6 +404,7 @@ class SerialService(threading.Thread):
                 raise IOError(f"fluid-set activation for {serial_number} was not acknowledged")
 
     def _handle(self, command: ServiceCommand) -> None:
+        self._log(f"COMMAND {command.name}: {command.payload or {}}")
         try:
             if command.name == "set":
                 self._apply(command.payload or {})
@@ -397,8 +422,10 @@ class SerialService(threading.Thread):
                 self.stopping.set()
             else:
                 raise ValueError(f"Unknown command {command.name}")
+            self._log(f"OK {command.name}")
         except Exception as exc:
             command.error = exc
+            self._log(f"ERROR {command.name}: {exc}")
         finally:
             if command.done:
                 command.done.set()
@@ -472,10 +499,10 @@ class ExperimentRunner(threading.Thread):
 
 
 class ExperimentPlot(tk.Canvas):
-    """Small dependency-free plot of planned channels and live MFC readings."""
+    """Dependency-free step plot of the planned channels and live MFC readings."""
 
-    def __init__(self, master: tk.Misc):
-        super().__init__(master, height=260, background="#ffffff", highlightthickness=1, highlightbackground="#b8c2cc")
+    def __init__(self, master: tk.Misc, height: int = 520):
+        super().__init__(master, height=height, background="#ffffff", highlightthickness=1, highlightbackground="#b8c2cc")
         self.plan: list[ExperimentPoint] = []
         self.h2_serial: str | None = None
         self.alkene_serial: str | None = None
@@ -508,26 +535,29 @@ class ExperimentPlot(tk.Canvas):
             self.create_line(left, y, left + chart_width, y, fill="#e5e7eb")
             self.create_text(left - 7, y, text=f"{value:g}", anchor="e", fill="#475569", font=("Segoe UI", 8))
         count = len(self.plan)
-        x_for = lambda index: left + chart_width * (index / max(count - 1, 1))
+        total_time = sum(point.dwell_s for point in self.plan)
+        x_for = lambda elapsed: left + chart_width * (elapsed / max(total_time, 1.0))
         y_for = lambda value: top + chart_height - chart_height * value / maximum
-        step = max(1, math.ceil(count / 8))
-        for index, point in enumerate(self.plan):
-            if index % step == 0 or index == count - 1:
-                x = x_for(index)
-                self.create_line(x, top + chart_height, x, top + chart_height + 4, fill="#64748b")
-                self.create_text(x, top + chart_height + 16, text=str(point.number), fill="#475569", font=("Segoe UI", 8))
-        self.create_text(left + chart_width / 2, height - 10, text="Experiment point", fill="#334155", font=("Segoe UI", 9))
+        for index in range(5):
+            elapsed = total_time * index / 4
+            x = x_for(elapsed)
+            self.create_line(x, top + chart_height, x, top + chart_height + 4, fill="#64748b")
+            self.create_text(x, top + chart_height + 16, text=f"{elapsed:g}", fill="#475569", font=("Segoe UI", 8))
+        self.create_text(left + chart_width / 2, height - 10, text="Time, s", fill="#334155", font=("Segoe UI", 9))
         series = (("H₂ setpoint", "#2563eb", [point.h2_flow for point in self.plan]), ("Alkene setpoint", "#d97706", [point.alkene_flow for point in self.plan]))
         for series_index, (label, color, values) in enumerate(series):
             coordinates: list[float] = []
-            for index, value in enumerate(values):
-                coordinates.extend((x_for(index), y_for(value)))
+            elapsed = 0.0
+            for point, value in zip(self.plan, values):
+                coordinates.extend((x_for(elapsed), y_for(value), x_for(elapsed + point.dwell_s), y_for(value)))
+                elapsed += point.dwell_s
             self.create_line(*coordinates, fill=color, width=2)
             legend_x = left + series_index * 145
             self.create_line(legend_x, 20, legend_x + 20, 20, fill=color, width=2)
             self.create_text(legend_x + 25, 20, text=label, anchor="w", fill="#334155", font=("Segoe UI", 9))
         if self.current_point is not None and 1 <= self.current_point <= count:
-            x = x_for(self.current_point - 1)
+            elapsed = sum(point.dwell_s for point in self.plan[:self.current_point - 1])
+            x = x_for(elapsed)
             self.create_line(x, top, x, top + chart_height, fill="#16a34a", dash=(3, 3))
             self.create_text(x + 4, top + 8, text=f"Current: {self.current_point}", anchor="w", fill="#166534", font=("Segoe UI", 9))
         readings: list[str] = []
@@ -538,6 +568,48 @@ class ExperimentPlot(tk.Canvas):
             self.create_text(left, height - 28, text="   |   ".join(readings), anchor="w", fill="#0f766e", font=("Segoe UI", 9))
 
 
+class ManualFlowCard(ttk.LabelFrame):
+    """One persistent editor per serial number; polling never replaces typed input."""
+
+    def __init__(self, master: tk.Misc, serial_number: str, set_flow: Any, zero_flow: Any):
+        super().__init__(master, text=f"MFC {serial_number}", padding=12)
+        self.flow_var = tk.StringVar(self, value="0")
+        self.gas_var = tk.StringVar(self)
+        self.unit_var = tk.StringVar(self)
+        self.measured_var = tk.StringVar(self)
+        self.setpoint_var = tk.StringVar(self)
+        self.command_var = tk.StringVar(self, value="Команды из этого окна ещё не отправлялись")
+        ttk.Label(self, textvariable=self.gas_var).pack(anchor="w")
+        ttk.Label(self, textvariable=self.measured_var, font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(8, 4))
+        ttk.Label(self, textvariable=self.setpoint_var).pack(anchor="w")
+        row = ttk.Frame(self)
+        row.pack(fill="x", pady=(10, 0))
+        ttk.Label(row, text="Задать поток:").pack(side="left")
+        self.entry = ttk.Entry(row, textvariable=self.flow_var, width=12)
+        self.entry.pack(side="left", padx=8)
+        self.entry.bind("<Return>", lambda _event: set_flow(serial_number))
+        ttk.Label(row, textvariable=self.unit_var).pack(side="left", padx=(0, 12))
+        self.set_button = ttk.Button(row, text="Установить", command=lambda: set_flow(serial_number))
+        self.set_button.pack(side="left")
+        self.zero_button = ttk.Button(row, text="Ноль", command=lambda: zero_flow(serial_number))
+        self.zero_button.pack(side="left", padx=8)
+        ttk.Label(self, textvariable=self.command_var, wraplength=720).pack(anchor="w", pady=(8, 0))
+
+    def update_device(self, device: DeviceInfo, role: str, mode: str) -> None:
+        self.configure(text=f"MFC {device.serial_number} · {device.port}")
+        mode_label = "чтение потока" if mode == "Read flow" else "выставление потока"
+        self.gas_var.set(f"Газ в приборе: {device.fluid_name}   |   Назначенная роль: {role}   |   Режим: {mode_label}")
+        self.unit_var.set(device.unit)
+        measured = "нет данных" if device.measured_flow is None else f"{device.measured_flow:.6g} {device.unit}"
+        setpoint = "нет данных" if device.setpoint_flow is None else f"{device.setpoint_flow:.6g} {device.unit}"
+        self.measured_var.set(f"Текущий поток: {measured}")
+        self.setpoint_var.set(f"Уставка, прочитанная из прибора: {setpoint}")
+
+    def set_enabled(self, enabled: bool) -> None:
+        for widget in (self.entry, self.set_button, self.zero_button):
+            widget.configure(state="normal" if enabled else "disabled")
+
+
 class GasLineApp(tk.Tk):
     def __init__(self, store: ConfigStore):
         super().__init__()
@@ -546,13 +618,16 @@ class GasLineApp(tk.Tk):
         self.store, self.events = store, queue.Queue()
         self.devices: dict[str, DeviceInfo] = {}
         self.roles = dict(store.roles)
+        self.device_modes = dict(store.device_modes)
         self.service = SerialService(store.serial, store.discovery, self.events)
         self.runner: ExperimentRunner | None = None
         self.control_enabled = tk.BooleanVar(value=False)
+        self.operation_mode = tk.StringVar(value="automatic")
+        self.operation_mode_hint = tk.StringVar()
         self.available_port_var = tk.StringVar(value="")
-        self.manual_device_var = tk.StringVar(value="")
-        self.manual_flow_var = tk.StringVar(value="0")
+        self.manual_cards: dict[str, ManualFlowCard] = {}
         self.role_device_var, self.role_var = tk.StringVar(value="No device detected"), tk.StringVar(value="Unassigned")
+        self.device_mode_var = tk.StringVar(value="Read flow")
         self.fluidset_var = tk.StringVar(value="")
         self.expected_gas_var = tk.StringVar(value="")
         self.inlet_pressure_var = tk.StringVar(value="")
@@ -570,7 +645,10 @@ class GasLineApp(tk.Tk):
         self.plan_h2_serial: str | None = None
         self.plan_alkene_serial: str | None = None
         self.current_plan_point: int | None = None
+        self.graph_window: tk.Toplevel | None = None
+        self.flow_plot: ExperimentPlot | None = None
         self.manual_setpoints: dict[str, float] = {}
+        self.manual_commands_pending: set[str] = set()
         self._connection_log_lines: list[str] = []
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -587,9 +665,29 @@ class GasLineApp(tk.Tk):
         connection_tab = ttk.Frame(self.notebook, padding=10)
         calibration_tab = ttk.Frame(self.notebook, padding=10)
         experiment_tab = ttk.Frame(self.notebook, padding=10)
+        console_tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(connection_tab, text="Подключение")
         self.notebook.add(calibration_tab, text="Параметры / калибровка")
         self.notebook.add(experiment_tab, text="Эксперимент")
+        self.notebook.add(console_tab, text="Консоль")
+
+        mode_frame = ttk.LabelFrame(experiment_tab, text="Operation mode", padding=8)
+        mode_frame.pack(fill="x", pady=(12, 0))
+        ttk.Radiobutton(
+            mode_frame,
+            text="Automatic — follow the validated H₂:alkene plan",
+            variable=self.operation_mode,
+            value="automatic",
+            command=self._operation_mode_changed,
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            mode_frame,
+            text="Manual — individual flow controls for each connected MFC",
+            variable=self.operation_mode,
+            value="manual",
+            command=self._operation_mode_changed,
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Label(mode_frame, textvariable=self.operation_mode_hint, foreground="#4b5563", wraplength=850).pack(anchor="w", pady=(6, 0))
 
         connect_frame = ttk.LabelFrame(connection_tab, text="Manual COM connection", padding=8)
         connect_frame.pack(fill="x", pady=(0, 10))
@@ -602,9 +700,9 @@ class GasLineApp(tk.Tk):
 
         devices_frame = ttk.LabelFrame(connection_tab, text="Automatically detected Bronkhorst devices", padding=8)
         devices_frame.pack(fill="x")
-        columns = ("serial", "role", "port", "address", "model", "capacity", "measured")
+        columns = ("serial", "role", "mode", "port", "address", "model", "capacity", "measured")
         self.tree = ttk.Treeview(devices_frame, columns=columns, show="headings", height=6)
-        for column, label in zip(columns, ("Serial number", "Gas role", "COM", "Protocol", "Model", "Capacity", "Measured")):
+        for column, label in zip(columns, ("Serial number", "Gas role", "MFC mode", "COM", "Protocol", "Model", "Capacity", "Measured")):
             self.tree.heading(column, text=label)
             self.tree.column(column, width=125 if column in {"serial", "model"} else 95, stretch=True)
         self.tree.pack(fill="x")
@@ -617,12 +715,20 @@ class GasLineApp(tk.Tk):
         ttk.Label(role_row, text="Connected gas:").pack(side="left")
         ttk.Combobox(role_row, textvariable=self.role_var, values=ROLES, state="readonly", width=12).pack(side="left", padx=6)
         ttk.Button(role_row, text="Save gas role", command=self._save_role).pack(side="left")
+        ttk.Label(role_row, text="MFC mode:").pack(side="left", padx=(18, 0))
+        self.device_mode_box = ttk.Combobox(role_row, textvariable=self.device_mode_var, values=MFC_MODES, state="disabled", width=15)
+        self.device_mode_box.pack(side="left", padx=6)
+        ttk.Button(role_row, text="Save MFC mode", command=self._save_device_mode).pack(side="left")
         ttk.Label(connection_tab, text="Role 'Other' is for carrier/purge/monitoring gas: it remains connected and visible, but is excluded from the H₂:alkene experiment plan.", foreground="#4b5563", wraplength=860).pack(anchor="w", pady=(8, 0))
         ttk.Label(connection_tab, text="The list refresh does not open ports. Connect only the COM ports used by MFCs; a device is retained through three short hub misses.", foreground="#4b5563", wraplength=860).pack(anchor="w", pady=(12, 0))
-        log_frame = ttk.LabelFrame(connection_tab, text="Connection log", padding=6)
+        ttk.Label(connection_tab, text="Журнал подключения и команд доступен на вкладке «Консоль».").pack(anchor="w", pady=(12, 0))
+        log_frame = ttk.LabelFrame(console_tab, text="Журнал событий", padding=6)
         log_frame.pack(fill="both", expand=True, pady=(8, 0))
         self.connection_log = tk.Text(log_frame, height=9, wrap="word", state="disabled", background="#111827", foreground="#d1fae5", insertbackground="#d1fae5", font=("Consolas", 9))
-        self.connection_log.pack(fill="both", expand=True)
+        log_scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.connection_log.yview)
+        log_scrollbar.pack(side="right", fill="y")
+        self.connection_log.configure(yscrollcommand=log_scrollbar.set)
+        self.connection_log.pack(side="left", fill="both", expand=True)
 
         calibration_devices_frame = ttk.LabelFrame(calibration_tab, text="Calibration overview: all connected channels", padding=8)
         calibration_devices_frame.pack(fill="x")
@@ -652,43 +758,68 @@ class GasLineApp(tk.Tk):
         ttk.Label(conditions_frame, text="Stored fluid-set conditions, not live pressure/temperature measurements.", foreground="#6b4f00").grid(row=3, column=2, columnspan=6, sticky="w", pady=(8, 0))
         ttk.Label(calibration_tab, text="Choose only a fluid-set slot that was configured for the physically connected gas. Values below are stored fluid-model conditions, not live pressure or temperature sensor readings.", wraplength=860, foreground="#4b5563").pack(anchor="w", pady=(12, 0))
 
-        plan_frame = ttk.LabelFrame(experiment_tab, text="Experiment: fixed H₂:alkene ratio, total-flow ramp", padding=8)
-        plan_frame.pack(fill="x", pady=(12, 0))
+        self.plan_frame = ttk.LabelFrame(experiment_tab, text="Experiment: fixed H₂:alkene ratio, total-flow ramp", padding=8)
+        self.plan_frame.pack(fill="x", pady=(12, 0))
         fields = (("Total from", "start"), ("to", "stop"), ("step", "step"), ("H₂ : alkene", "ratio"), ("Dwell / point, s", "dwell"))
+        self.plan_input_widgets: list[ttk.Entry] = []
         for i, (label, key) in enumerate(fields):
-            ttk.Label(plan_frame, text=label).grid(row=0, column=i * 2, sticky="w", padx=(0, 4))
-            ttk.Entry(plan_frame, textvariable=self.plan_vars[key], width=9).grid(row=0, column=i * 2 + 1, sticky="w", padx=(0, 12))
-        ttk.Button(plan_frame, text="Validate plan", command=self._validate_plan).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(plan_frame, textvariable=self.plan_var, wraplength=850).grid(row=1, column=2, columnspan=8, sticky="w", pady=(8, 0))
+            ttk.Label(self.plan_frame, text=label).grid(row=0, column=i * 2, sticky="w", padx=(0, 4))
+            entry = ttk.Entry(self.plan_frame, textvariable=self.plan_vars[key], width=9)
+            entry.grid(row=0, column=i * 2 + 1, sticky="w", padx=(0, 12))
+            self.plan_input_widgets.append(entry)
+        self.validate_plan_button = ttk.Button(self.plan_frame, text="Validate plan", command=self._validate_plan)
+        self.validate_plan_button.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(self.plan_frame, textvariable=self.plan_var, wraplength=850).grid(row=1, column=2, columnspan=8, sticky="w", pady=(8, 0))
 
-        plan_view_frame = ttk.LabelFrame(experiment_tab, text="Experiment schedule and flow graph", padding=8)
-        plan_view_frame.pack(fill="both", expand=True, pady=(12, 0))
+        self.plan_view_frame = ttk.LabelFrame(experiment_tab, text="Experiment schedule", padding=8)
+        self.plan_view_frame.pack(fill="both", expand=True, pady=(12, 0))
+        schedule_actions = ttk.Frame(self.plan_view_frame)
+        schedule_actions.pack(fill="x", pady=(0, 8))
+        ttk.Button(schedule_actions, text="Open graph in a separate window", command=self._open_graph_window).pack(side="left")
+        ttk.Label(schedule_actions, text="The graph shows a stepped setpoint held for the selected dwell time.", foreground="#4b5563").pack(side="left", padx=12)
+        schedule_body = ttk.Frame(self.plan_view_frame)
+        schedule_body.pack(fill="both", expand=True)
         schedule_columns = ("point", "total", "h2", "alkene", "dwell")
-        self.schedule_tree = ttk.Treeview(plan_view_frame, columns=schedule_columns, show="headings", height=6)
+        self.schedule_tree = ttk.Treeview(schedule_body, columns=schedule_columns, show="headings", height=12)
         for column, label in zip(schedule_columns, ("Point", "Total", "H₂ setpoint", "Alkene setpoint", "Dwell, s")):
             self.schedule_tree.heading(column, text=label)
             self.schedule_tree.column(column, width=125, stretch=True)
-        self.schedule_tree.pack(fill="x")
-        self.flow_plot = ExperimentPlot(plan_view_frame)
-        self.flow_plot.pack(fill="x", expand=True, pady=(10, 0))
+        schedule_scrollbar = ttk.Scrollbar(schedule_body, orient="vertical", command=self.schedule_tree.yview)
+        schedule_scrollbar.pack(side="right", fill="y")
+        self.schedule_tree.configure(yscrollcommand=schedule_scrollbar.set)
+        self.schedule_tree.pack(side="left", fill="both", expand=True)
 
-        manual_frame = ttk.LabelFrame(experiment_tab, text="Manual flow control", padding=8)
-        manual_frame.pack(fill="x", pady=(12, 0))
-        ttk.Label(manual_frame, text="Connected MFC:").pack(side="left")
-        self.manual_device_box = ttk.Combobox(manual_frame, textvariable=self.manual_device_var, state="disabled", width=20)
-        self.manual_device_box.pack(side="left", padx=(6, 12))
-        ttk.Label(manual_frame, text="Setpoint, device unit/min:").pack(side="left")
-        ttk.Entry(manual_frame, textvariable=self.manual_flow_var, width=10).pack(side="left", padx=(6, 8))
-        ttk.Button(manual_frame, text="Set manual flow", command=self._set_manual_flow).pack(side="left")
-        ttk.Button(manual_frame, text="Set selected channel to zero", command=self._zero_manual_flow).pack(side="left", padx=8)
-        controls = ttk.Frame(experiment_tab)
-        controls.pack(fill="x", pady=12)
-        ttk.Checkbutton(controls, text="Enable writing setpoints", variable=self.control_enabled, command=self._toggle_control).pack(side="left")
-        ttk.Button(controls, text="Start experiment", command=self._start_experiment).pack(side="left", padx=8)
-        ttk.Button(controls, text="STOP and set H₂/alkene to zero", command=self._stop_experiment).pack(side="left")
-        ttk.Label(experiment_tab, textvariable=self.progress_var).pack(anchor="w")
+        self.manual_frame = ttk.LabelFrame(experiment_tab, text="Manual flow control", padding=8)
+        self.manual_frame.pack(fill="both", expand=True, pady=(12, 0))
+        self.manual_canvas = tk.Canvas(self.manual_frame, highlightthickness=0, height=260)
+        manual_scrollbar = ttk.Scrollbar(self.manual_frame, orient="vertical", command=self.manual_canvas.yview)
+        manual_scrollbar.pack(side="right", fill="y")
+        self.manual_canvas.configure(yscrollcommand=manual_scrollbar.set)
+        self.manual_canvas.pack(side="left", fill="both", expand=True)
+        self.manual_cards_frame = ttk.Frame(self.manual_canvas)
+        cards_window = self.manual_canvas.create_window((0, 0), window=self.manual_cards_frame, anchor="nw")
+        self.manual_canvas.bind("<Configure>", lambda event: self.manual_canvas.itemconfigure(cards_window, width=event.width))
+        self.manual_cards_frame.bind("<Configure>", lambda _event: self.manual_canvas.configure(scrollregion=self.manual_canvas.bbox("all")))
+        self.manual_empty_label = ttk.Label(self.manual_cards_frame, text="Нет подключённых MFC. Подключите прибор на вкладке «Подключение».", padding=12)
+        self.manual_empty_label.pack(anchor="w")
+        self.auto_controls = ttk.Frame(experiment_tab)
+        self.auto_controls.pack(fill="x", pady=8, before=self.plan_view_frame)
+        self.enable_writing_check = ttk.Checkbutton(
+            self.auto_controls,
+            text="Enable writing setpoints",
+            variable=self.control_enabled,
+            command=self._toggle_control,
+        )
+        self.enable_writing_check.pack(side="left")
+        self.start_experiment_button = ttk.Button(self.auto_controls, text="Start experiment", command=self._start_experiment)
+        self.start_experiment_button.pack(side="left", padx=8)
+        self.stop_experiment_button = ttk.Button(self.auto_controls, text="STOP and set H₂/alkene to zero", command=self._stop_experiment)
+        self.stop_experiment_button.pack(side="left")
+        self.progress_label = ttk.Label(experiment_tab, textvariable=self.progress_var)
+        self.progress_label.pack(anchor="w")
         ttk.Label(body, textvariable=self.port_warning_var, foreground="#9b1c1c", wraplength=880).pack(anchor="w", pady=(8, 0))
         ttk.Label(body, textvariable=self.status_var, wraplength=880).pack(anchor="w", pady=(4, 0))
+        self._update_operation_mode_controls()
 
     def _update_available_ports(self) -> None:
         ports = sorted(
@@ -704,13 +835,89 @@ class GasLineApp(tk.Tk):
         if self.winfo_exists():
             self.after(2000, self._refresh_available_ports)
 
+    def _operation_mode_changed(self) -> None:
+        if self.operation_mode.get() == "manual" and self.runner and self.runner.is_alive():
+            self.operation_mode.set("automatic")
+            messagebox.showwarning("Experiment running", "Stop the automatic experiment before switching to manual control.")
+        elif self.operation_mode.get() == "automatic" and (
+            self.manual_commands_pending or any(flow > 0 for flow in self.manual_setpoints.values())
+        ):
+            self.operation_mode.set("manual")
+            messagebox.showwarning(
+                "Manual flow active",
+                "Wait for the manual command to finish and set every manually controlled MFC to zero before switching modes.",
+            )
+        self._update_operation_mode_controls()
+
+    def _update_operation_mode_controls(self) -> None:
+        automatic = self.operation_mode.get() == "automatic"
+        if automatic:
+            self.manual_frame.pack_forget()
+            if not self.start_experiment_button.winfo_manager():
+                self.start_experiment_button.pack(side="left", padx=8)
+            if not self.stop_experiment_button.winfo_manager():
+                self.stop_experiment_button.pack(side="left")
+            if not self.enable_writing_check.winfo_manager():
+                self.enable_writing_check.pack(side="left", before=self.start_experiment_button)
+            if not self.plan_frame.winfo_manager():
+                self.plan_frame.pack(fill="x", pady=(12, 0), before=self.progress_label)
+            if not self.plan_view_frame.winfo_manager():
+                self.plan_view_frame.pack(fill="both", expand=True, pady=(12, 0), before=self.progress_label)
+            self.auto_controls.pack_forget()
+            self.auto_controls.pack(fill="x", pady=8, before=self.plan_view_frame)
+        else:
+            self.plan_frame.pack_forget()
+            self.plan_view_frame.pack_forget()
+            self.auto_controls.pack_forget()
+            self.manual_frame.pack_forget()
+            self.manual_frame.pack(fill="both", expand=True, pady=(12, 0), before=self.progress_label)
+        for widget in self.plan_input_widgets:
+            widget.configure(state="normal" if automatic else "disabled")
+        for widget in (self.validate_plan_button, self.start_experiment_button, self.stop_experiment_button):
+            widget.configure(state="normal" if automatic else "disabled")
+
+        for serial_number, card in self.manual_cards.items():
+            card.set_enabled(
+                not automatic
+                and self.device_modes.get(serial_number, "Read flow") == "Set flow"
+                and serial_number not in self.manual_commands_pending
+            )
+        if automatic:
+            self.operation_mode_hint.set("The controller will apply every validated point in sequence. Manual setpoints are disabled.")
+        elif self.devices:
+            self.operation_mode_hint.set("Задавайте поток в карточке нужного MFC. Кнопки «Установить» и «Ноль» отправляют команду сразу.")
+        else:
+            self.operation_mode_hint.set("Сначала подключите масс-флоу на вкладке «Подключение».")
+
+    def _update_manual_cards(self) -> None:
+        for serial_number in set(self.manual_cards) - self.devices.keys():
+            self.manual_cards.pop(serial_number).destroy()
+        for serial_number in sorted(self.devices):
+            if serial_number not in self.manual_cards:
+                self.manual_cards[serial_number] = ManualFlowCard(
+                    self.manual_cards_frame, serial_number, self._set_manual_flow, self._zero_manual_flow,
+                )
+            card = self.manual_cards[serial_number]
+            card.pack(fill="x", pady=(0, 10))
+            card.update_device(
+                self.devices[serial_number],
+                self.roles.get(serial_number, "Unassigned"),
+                self.device_modes.get(serial_number, "Read flow"),
+            )
+        if self.manual_cards:
+            self.manual_empty_label.pack_forget()
+        elif not self.manual_empty_label.winfo_manager():
+            self.manual_empty_label.pack(anchor="w")
+
     def _append_connection_log(self, message: str) -> None:
         self._connection_log_lines.append(message)
-        self._connection_log_lines = self._connection_log_lines[-250:]
+        self._connection_log_lines = self._connection_log_lines[-2000:]
+        at_bottom = self.connection_log.yview()[1] >= 0.99
         self.connection_log.configure(state="normal")
         self.connection_log.delete("1.0", "end")
         self.connection_log.insert("end", "\n".join(self._connection_log_lines) + "\n")
-        self.connection_log.see("end")
+        if at_bottom:
+            self.connection_log.see("end")
         self.connection_log.configure(state="disabled")
 
     def _connect_selected_port(self) -> None:
@@ -733,8 +940,11 @@ class GasLineApp(tk.Tk):
         try:
             self.service.submit(action, {"port": port}, timeout_s=12)
             self.events.put(("connection_log", f"{time.strftime('%H:%M:%S')}  UI: {action} completed for {port}."))
+            self.events.put(("connection_status", f"Connected {port}."))
         except Exception as exc:
-            self.events.put(("connection_log", f"{time.strftime('%H:%M:%S')}  UI: {action} failed for {port}: {exc}"))
+            message = f"{action} failed for {port}: {exc}"
+            self.events.put(("connection_log", f"{time.strftime('%H:%M:%S')}  UI: {message}"))
+            self.events.put(("connection_error", message))
 
     def _update_devices(self, devices: list[DeviceInfo]) -> None:
         self.devices = {device.serial_number: device for device in devices}
@@ -748,7 +958,16 @@ class GasLineApp(tk.Tk):
         for serial_number, device in self.devices.items():
             capacity = "unknown" if device.capacity is None else f"{device.capacity:.6g} {device.unit}"
             measured = "—" if device.measured_flow is None else f"{device.measured_flow:.6g} {device.unit}"
-            values = (serial_number, self.roles.get(serial_number, "Unassigned"), device.port, "ProPar", device.model, capacity, measured)
+            values = (
+                serial_number,
+                self.roles.get(serial_number, "Unassigned"),
+                self.device_modes.get(serial_number, "Read flow"),
+                device.port,
+                "ProPar",
+                device.model,
+                capacity,
+                measured,
+            )
             if serial_number in unseen:
                 self.tree.item(serial_number, values=values)
                 unseen.remove(serial_number)
@@ -759,23 +978,19 @@ class GasLineApp(tk.Tk):
         self._update_calibration_table()
         serials = sorted(self.devices)
         self.role_device_box["values"] = serials
-        self.manual_device_box["values"] = serials
-        if serials:
-            self.manual_device_box.configure(state="readonly")
-            if self.manual_device_var.get() not in serials:
-                self.manual_device_var.set(serials[0])
-        else:
-            self.manual_device_box.configure(state="disabled")
-            self.manual_device_var.set("")
+        self._update_manual_cards()
         if serials:
             self.role_device_box.configure(state="readonly")
+            self.device_mode_box.configure(state="readonly")
             if self.role_device_var.get() not in serials:
                 self.role_device_var.set(serials[0])
                 self._load_role()
         else:
             self.role_device_box.configure(state="disabled")
+            self.device_mode_box.configure(state="disabled")
             self.role_device_var.set("No device detected")
             self.role_var.set("Unassigned")
+            self.device_mode_var.set("Read flow")
         selected = self.devices.get(self.role_device_var.get())
         if selected is not None:
             snapshot = self._condition_snapshot(selected)
@@ -783,6 +998,7 @@ class GasLineApp(tk.Tk):
                 self._load_role()
         if mismatches:
             self.port_warning_var.set("GAS PROFILE MISMATCH — do not start flow: " + " ".join(mismatches))
+        self._update_operation_mode_controls()
         self._redraw_experiment_view()
         self.status_var.set(f"Connected Bronkhorst devices: {len(serials)}. Available USB COM list refreshes every 2 s; only ports selected with Connect are opened.")
 
@@ -828,6 +1044,7 @@ class GasLineApp(tk.Tk):
     def _load_role(self, _event: object | None = None) -> None:
         serial_number = self.role_device_var.get()
         self.role_var.set(self.roles.get(serial_number, "Unassigned"))
+        self.device_mode_var.set(self.device_modes.get(serial_number, "Read flow"))
         device = self.devices.get(serial_number)
         if device is None:
             self.fluid_conditions_var.set("Select a detected device to inspect its active gas calibration.")
@@ -941,6 +1158,20 @@ class GasLineApp(tk.Tk):
         self._update_devices(list(self.devices.values()))
         self.status_var.set(f"Saved role for {serial_number}: {role}.")
 
+    def _save_device_mode(self) -> None:
+        serial_number, mode = self.role_device_var.get(), self.device_mode_var.get()
+        if serial_number not in self.devices:
+            messagebox.showwarning("No device", "Select a connected device first.")
+            return
+        if mode not in MFC_MODES:
+            messagebox.showwarning("Invalid MFC mode", "Choose Read flow or Set flow.")
+            return
+        self.device_modes[serial_number] = mode
+        self.store.save_device_modes(self.device_modes)
+        self._update_devices(list(self.devices.values()))
+        label = "чтение потока" if mode == "Read flow" else "выставление потока"
+        self.status_var.set(f"Режим {serial_number}: {label}.")
+
     def _role_devices(self) -> tuple[DeviceInfo, DeviceInfo]:
         h2 = [self.devices[serial] for serial, role in self.roles.items() if role == "H2" and serial in self.devices]
         alkene = [self.devices[serial] for serial, role in self.roles.items() if role == "Alkene" and serial in self.devices]
@@ -951,6 +1182,8 @@ class GasLineApp(tk.Tk):
         if h2[0].capacity is None or alkene[0].capacity is None:
             raise ValueError("Could not read both capacities; writing is blocked.")
         for device in (h2[0], alkene[0]):
+            if self.device_modes.get(device.serial_number, "Read flow") != "Set flow":
+                raise ValueError(f"{device.serial_number} is in Read flow mode; choose Set flow before starting the plan.")
             profile = self.store.fluid_profiles.get(device.serial_number, {}).get(str(device.fluidset_index), {})
             expected = str(profile.get("expected_gas", "")).strip()
             if expected and expected.casefold() != device.fluid_name.casefold():
@@ -960,6 +1193,8 @@ class GasLineApp(tk.Tk):
         return h2[0], alkene[0]
 
     def _redraw_experiment_view(self) -> None:
+        if self.flow_plot is None or not self.flow_plot.winfo_exists():
+            return
         self.flow_plot.set_data(
             self.active_plan,
             self.plan_h2_serial,
@@ -967,6 +1202,25 @@ class GasLineApp(tk.Tk):
             self.devices,
             self.current_plan_point,
         )
+
+    def _open_graph_window(self) -> None:
+        if self.graph_window is None or not self.graph_window.winfo_exists():
+            self.graph_window = tk.Toplevel(self)
+            self.graph_window.title("Experiment flow graph")
+            self.graph_window.geometry("1100x680")
+            self.graph_window.minsize(720, 440)
+            self.graph_window.protocol("WM_DELETE_WINDOW", self._close_graph_window)
+            self.flow_plot = ExperimentPlot(self.graph_window)
+            self.flow_plot.pack(fill="both", expand=True, padx=12, pady=12)
+        self.graph_window.deiconify()
+        self.graph_window.lift()
+        self._redraw_experiment_view()
+
+    def _close_graph_window(self) -> None:
+        if self.graph_window is not None and self.graph_window.winfo_exists():
+            self.graph_window.destroy()
+        self.graph_window = None
+        self.flow_plot = None
 
     def _show_plan(self, plan: list[ExperimentPoint], h2: DeviceInfo, alkene: DeviceInfo) -> None:
         self.active_plan = list(plan)
@@ -981,17 +1235,22 @@ class GasLineApp(tk.Tk):
             )
         self._redraw_experiment_view()
 
-    def _manual_flow_request(self, flow: float) -> None:
-        if not self.control_enabled.get():
-            messagebox.showwarning("Writes disabled", "Enable writing setpoints before manual flow control.")
+    def _manual_flow_request(self, serial_number: str, flow: float) -> None:
+        if self.operation_mode.get() != "manual":
+            messagebox.showinfo("Automatic mode", "Select Manual mode before sending a setpoint to an individual MFC.")
             return
         if self.runner and self.runner.is_alive():
             messagebox.showwarning("Experiment running", "Stop the scheduled experiment before using manual flow control.")
             return
-        serial_number = self.manual_device_var.get()
+        if serial_number in self.manual_commands_pending:
+            messagebox.showwarning("Command in progress", "Wait for the previous manual setpoint command to finish.")
+            return
         device = self.devices.get(serial_number)
         if device is None:
             messagebox.showwarning("No device", "Connect and select an MFC first.")
+            return
+        if self.device_modes.get(serial_number, "Read flow") != "Set flow":
+            messagebox.showwarning("Read flow mode", f"{serial_number} is configured for flow reading. Choose Set flow before sending a setpoint.")
             return
         if not math.isfinite(flow) or flow < 0:
             messagebox.showwarning("Invalid flow", "Enter a finite non-negative setpoint.")
@@ -999,27 +1258,34 @@ class GasLineApp(tk.Tk):
         if device.capacity is None or flow > device.capacity + 1e-7:
             messagebox.showwarning("Out of range", f"Allowed range for {serial_number}: 0–{device.capacity:g} {device.unit}" if device.capacity is not None else "The device capacity is unknown.")
             return
-        if not messagebox.askyesno("Confirm manual flow", f"Set {serial_number} ({device.fluid_name}) to {flow:g} {device.unit}?\n\nVerify gas routing, pressure protection and shutdown valves first."):
-            return
+        self.manual_commands_pending.add(serial_number)
+        self.manual_cards[serial_number].command_var.set(f"Отправка уставки: {flow:g} {device.unit}…")
+        self._update_operation_mode_controls()
         threading.Thread(target=self._run_manual_setpoint, args=(serial_number, flow), daemon=True).start()
 
-    def _set_manual_flow(self) -> None:
+    def _set_manual_flow(self, serial_number: str) -> None:
+        card = self.manual_cards.get(serial_number)
+        if card is None:
+            return
         try:
-            flow = float(self.manual_flow_var.get().replace(",", "."))
+            flow = float(card.flow_var.get().replace(",", "."))
         except ValueError:
             messagebox.showwarning("Invalid flow", "Enter a numeric setpoint.")
             return
-        self._manual_flow_request(flow)
+        self._manual_flow_request(serial_number, flow)
 
-    def _zero_manual_flow(self) -> None:
-        self._manual_flow_request(0.0)
+    def _zero_manual_flow(self, serial_number: str) -> None:
+        card = self.manual_cards.get(serial_number)
+        if card is not None:
+            card.flow_var.set("0")
+            self._manual_flow_request(serial_number, 0.0)
 
     def _run_manual_setpoint(self, serial_number: str, flow: float) -> None:
         try:
             self.service.submit("set", {serial_number: flow})
             self.events.put(("manual_setpoint", (serial_number, flow)))
         except Exception as exc:
-            self.events.put(("runner_error", f"Manual setpoint failed: {exc}"))
+            self.events.put(("manual_setpoint_error", (serial_number, str(exc))))
 
     def _current_plan(self) -> list[ExperimentPoint]:
         try:
@@ -1029,6 +1295,9 @@ class GasLineApp(tk.Tk):
         return build_plan(values["start"], values["stop"], values["step"], values["ratio"], values["dwell"])
 
     def _validate_plan(self) -> list[ExperimentPoint] | None:
+        if self.operation_mode.get() != "automatic":
+            self.plan_var.set("Select Automatic mode to validate a scheduled plan.")
+            return None
         try:
             plan = self._current_plan()
             h2, alkene = self._role_devices()
@@ -1048,6 +1317,9 @@ class GasLineApp(tk.Tk):
             self.control_enabled.set(False)
 
     def _start_experiment(self) -> None:
+        if self.operation_mode.get() != "automatic":
+            messagebox.showinfo("Manual mode", "Switch to Automatic mode before starting the scheduled experiment.")
+            return
         if not self.control_enabled.get():
             messagebox.showwarning("Writes disabled", "Enable writing setpoints before starting.")
             return
@@ -1065,6 +1337,9 @@ class GasLineApp(tk.Tk):
         self.progress_var.set("Starting experiment…")
 
     def _stop_experiment(self) -> None:
+        if self.operation_mode.get() != "automatic":
+            messagebox.showinfo("Manual mode", "Use 'Set selected channel to zero' to stop the manually selected MFC.")
+            return
         if not self.runner or not self.runner.is_alive():
             messagebox.showinfo("No active experiment", "No scheduled experiment is running.")
             return
@@ -1080,6 +1355,7 @@ class GasLineApp(tk.Tk):
                     self._update_devices(payload)
                 elif kind == "stage":
                     point, _ = payload
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {point.number}: H2={point.h2_flow:g}, alkene={point.alkene_flow:g}, dwell={point.dwell_s:g} s")
                     self.current_plan_point = point.number
                     self.schedule_tree.selection_set(f"point-{point.number}")
                     self.schedule_tree.see(f"point-{point.number}")
@@ -1089,10 +1365,12 @@ class GasLineApp(tk.Tk):
                     number, elapsed, dwell = payload
                     self.progress_var.set(f"Point {number}: stabilization {elapsed:.0f}/{dwell:.0f} s")
                 elif kind == "finished":
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  {payload}")
                     self.progress_var.set(payload)
                     self.current_plan_point = None
                     self._redraw_experiment_view()
                 elif kind == "runner_error":
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  EXPERIMENT ERROR: {payload}")
                     self.progress_var.set("EXPERIMENT ERROR: " + payload)
                     self.control_enabled.set(False)
                 elif kind == "port_warning":
@@ -1101,12 +1379,34 @@ class GasLineApp(tk.Tk):
                     self.port_warning_var.set(payload)
                 elif kind == "connection_log":
                     self._append_connection_log(payload)
+                elif kind == "connection_status":
+                    self.port_warning_var.set("")
+                    self.status_var.set(payload)
+                elif kind == "connection_error":
+                    self.port_warning_var.set(payload)
+                    self.status_var.set("Connection failed; see the Console tab for details.")
                 elif kind == "manual_setpoint":
                     serial_number, flow = payload
+                    self.manual_commands_pending.discard(serial_number)
                     self.manual_setpoints[serial_number] = flow
                     device = self.devices.get(serial_number)
                     unit = "device unit" if device is None else device.unit
                     self.progress_var.set(f"Manual setpoint acknowledged: {serial_number} = {flow:g} {unit}.")
+                    card = self.manual_cards.get(serial_number)
+                    if card is not None:
+                        card.command_var.set(f"Последняя команда принята: {flow:g} {unit}")
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  MANUAL {serial_number}: accepted setpoint {flow:g} {unit}")
+                    self._update_operation_mode_controls()
+                elif kind == "manual_setpoint_error":
+                    serial_number, error = payload
+                    self.manual_commands_pending.discard(serial_number)
+                    self.progress_var.set(f"MANUAL SETPOINT ERROR {serial_number}: {error}")
+                    card = self.manual_cards.get(serial_number)
+                    if card is not None:
+                        card.command_var.set(f"Ошибка команды: {error}")
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  MANUAL ERROR {serial_number}: {error}")
+                    self.control_enabled.set(False)
+                    self._update_operation_mode_controls()
         except queue.Empty:
             pass
         if self.winfo_exists():
