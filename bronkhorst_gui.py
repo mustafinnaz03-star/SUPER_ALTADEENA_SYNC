@@ -27,6 +27,9 @@ from serial.tools import list_ports
 # FlowDDE parameter numbers, used by the EL-FLOW RS232/FLOW-BUS (ProPar) interface.
 FMEASURE, FSETPOINT, CAPACITY, CAPACITY_UNIT = 205, 206, 21, 129
 MODEL, SERIAL_NUMBER = 91, 92
+FLUIDSET_INDEX, FLUID_NAME = 24, 25
+INLET_PRESSURE, OUTLET_PRESSURE, FLUID_TEMPERATURE = 178, 179, 181
+REFERENCE_PRESSURE = 246
 ROLES = ("Unassigned", "H2", "Alkene", "Other")
 
 # A busy COM port is an expected state during discovery (for example when
@@ -43,6 +46,12 @@ class DeviceInfo:
     capacity: float | None
     unit: str
     measured_flow: float | None = None
+    fluid_name: str = "Unknown"
+    fluidset_index: int | None = None
+    inlet_pressure_bar_a: float | None = None
+    outlet_pressure_bar_a: float | None = None
+    fluid_temperature_c: float | None = None
+    reference_pressure_bar_a: float | None = None
 
 
 @dataclass(frozen=True)
@@ -57,7 +66,7 @@ class ExperimentPoint:
 @dataclass
 class ServiceCommand:
     name: str
-    payload: dict[str, float] | None = None
+    payload: dict[str, Any] | None = None
     done: threading.Event | None = None
     error: Exception | None = None
 
@@ -121,11 +130,21 @@ class ConfigStore:
         if not 0.5 <= self.discovery["scan_interval_s"] <= 120 or not 0.02 <= self.discovery["probe_timeout_s"] <= 5:
             raise ValueError("Invalid discovery timing")
         self.roles = {str(serial): str(role) for serial, role in self.raw.get("roles", {}).items() if str(role) in ROLES}
+        raw_profiles = self.raw.get("fluid_profiles", {})
+        self.fluid_profiles: dict[str, dict[str, dict[str, Any]]] = {
+            str(serial): {str(slot): dict(profile) for slot, profile in slots.items() if isinstance(profile, dict)}
+            for serial, slots in raw_profiles.items() if isinstance(slots, dict)
+        }
 
     def save_roles(self, roles: dict[str, str]) -> None:
         self.raw["roles"] = roles
         self.path.write_text(json.dumps(self.raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         self.roles = dict(roles)
+
+    def save_fluid_profile(self, serial_number: str, fluidset_index: int, profile: dict[str, Any]) -> None:
+        self.fluid_profiles.setdefault(serial_number, {})[str(fluidset_index)] = dict(profile)
+        self.raw["fluid_profiles"] = self.fluid_profiles
+        self.path.write_text(json.dumps(self.raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 class SerialService(threading.Thread):
@@ -171,7 +190,23 @@ class SerialService(threading.Thread):
                 capacity = None
         except Exception:
             capacity, unit = None, "device unit"
-        return DeviceInfo(serial_number, model or "EL-FLOW Prestige", port, 0x80, capacity, unit, measured)
+        # These are stored parameters of the active fluid set, not live pressure
+        # readings.  They are nevertheless essential for interpreting a volume
+        # flow in the unit selected on the instrument.
+        try:
+            fluid_name = str(self._read(client, FLUID_NAME, "fluid name")).strip() or "Unknown"
+            fluidset_index = int(self._read(client, FLUIDSET_INDEX, "fluid-set index"))
+            inlet = float(self._read(client, INLET_PRESSURE, "inlet pressure"))
+            outlet = float(self._read(client, OUTLET_PRESSURE, "outlet pressure"))
+            temperature = float(self._read(client, FLUID_TEMPERATURE, "fluid temperature"))
+            reference = float(self._read(client, REFERENCE_PRESSURE, "reference pressure"))
+        except Exception:
+            fluid_name, fluidset_index = "Unknown", None
+            inlet = outlet = temperature = reference = None
+        return DeviceInfo(
+            serial_number, model or "EL-FLOW Prestige", port, 0x80, capacity, unit, measured,
+            fluid_name, fluidset_index, inlet, outlet, temperature, reference,
+        )
 
     def _candidate_ports(self) -> list[str]:
         if self.discovery["ports"]:
@@ -234,12 +269,48 @@ class SerialService(threading.Thread):
             if not self._client(device.port, self.serial["timeout_s"]).writeParameter(FSETPOINT, value):
                 raise IOError(f"write setpoint to {serial_number} was not acknowledged")
 
+    def _apply_fluid_conditions(self, conditions: dict[str, dict[str, float]]) -> None:
+        """Write explicit conditions to the active fluid set, never sensor calibration constants."""
+        for serial_number, values in conditions.items():
+            device = self.devices.get(serial_number)
+            if device is None:
+                raise ConnectionError(f"Device {serial_number} is not connected")
+            inlet, outlet = float(values["inlet"]), float(values["outlet"])
+            temperature, reference = float(values["temperature"]), float(values["reference"])
+            if not all(math.isfinite(value) for value in (inlet, outlet, temperature, reference)):
+                raise ValueError("Fluid conditions must be finite values")
+            if inlet <= 0 or outlet <= 0 or reference <= 0:
+                raise ValueError("Pressures must be positive values in bar(a)")
+            client = self._client(device.port, self.serial["timeout_s"])
+            for parameter, value, label in (
+                (INLET_PRESSURE, inlet, "inlet pressure"),
+                (OUTLET_PRESSURE, outlet, "outlet pressure"),
+                (FLUID_TEMPERATURE, temperature, "fluid temperature"),
+                (REFERENCE_PRESSURE, reference, "volume reference pressure"),
+            ):
+                if not client.writeParameter(parameter, value):
+                    raise IOError(f"{label} update for {serial_number} was not acknowledged")
+
+    def _activate_fluidset(self, fluidsets: dict[str, int]) -> None:
+        for serial_number, fluidset in fluidsets.items():
+            device = self.devices.get(serial_number)
+            if device is None:
+                raise ConnectionError(f"Device {serial_number} is not connected")
+            if not isinstance(fluidset, int) or not 0 <= fluidset <= 7:
+                raise ValueError("Fluid-set slot must be an integer from 0 to 7")
+            if not self._client(device.port, self.serial["timeout_s"]).writeParameter(FLUIDSET_INDEX, fluidset):
+                raise IOError(f"fluid-set activation for {serial_number} was not acknowledged")
+
     def _handle(self, command: ServiceCommand) -> None:
         try:
             if command.name == "set":
                 self._apply(command.payload or {})
             elif command.name == "zero":
                 self._apply({serial: 0.0 for serial in (command.payload or {})})
+            elif command.name == "set_fluid_conditions":
+                self._apply_fluid_conditions(command.payload or {})
+            elif command.name == "activate_fluidset":
+                self._activate_fluidset(command.payload or {})
             elif command.name == "stop":
                 self.stopping.set()
             else:
@@ -250,7 +321,7 @@ class SerialService(threading.Thread):
             if command.done:
                 command.done.set()
 
-    def submit(self, name: str, payload: dict[str, float] | None, timeout_s: float = 5) -> None:
+    def submit(self, name: str, payload: dict[str, Any] | None, timeout_s: float = 5) -> None:
         done = threading.Event()
         command = ServiceCommand(name, payload, done)
         self.commands.put(command)
@@ -322,7 +393,7 @@ class GasLineApp(tk.Tk):
     def __init__(self, store: ConfigStore):
         super().__init__()
         self.title("Bronkhorst gas line — auto discovery and experiments")
-        self.minsize(920, 560)
+        self.minsize(920, 650)
         self.store, self.events = store, queue.Queue()
         self.devices: dict[str, DeviceInfo] = {}
         self.roles = dict(store.roles)
@@ -330,6 +401,14 @@ class GasLineApp(tk.Tk):
         self.runner: ExperimentRunner | None = None
         self.control_enabled = tk.BooleanVar(value=False)
         self.role_device_var, self.role_var = tk.StringVar(value="No device detected"), tk.StringVar(value="Unassigned")
+        self.fluidset_var = tk.StringVar(value="")
+        self.expected_gas_var = tk.StringVar(value="")
+        self.inlet_pressure_var = tk.StringVar(value="")
+        self.outlet_pressure_var = tk.StringVar(value="")
+        self.fluid_temperature_var = tk.StringVar(value="")
+        self.reference_pressure_var = tk.StringVar(value="")
+        self.fluid_conditions_var = tk.StringVar(value="Select a detected device to inspect its active gas calibration.")
+        self._conditions_snapshot: tuple[Any, ...] | None = None
         self.plan_vars = {key: tk.StringVar(value=value) for key, value in {"start": "10", "stop": "150", "step": "10", "ratio": "4", "dwell": "60"}.items()}
         self.status_var = tk.StringVar(value="Waiting for USB Bronkhorst devices…")
         self.port_warning_var = tk.StringVar(value="")
@@ -361,6 +440,20 @@ class GasLineApp(tk.Tk):
         ttk.Label(role_row, text="Connected gas:").pack(side="left")
         ttk.Combobox(role_row, textvariable=self.role_var, values=ROLES, state="readonly", width=12).pack(side="left", padx=6)
         ttk.Button(role_row, text="Save gas role", command=self._save_role).pack(side="left")
+        conditions_frame = ttk.LabelFrame(body, text="Active gas calibration and inlet condition", padding=8)
+        conditions_frame.pack(fill="x", pady=(12, 0))
+        ttk.Label(conditions_frame, textvariable=self.fluid_conditions_var, wraplength=850).grid(row=0, column=0, columnspan=5, sticky="w")
+        ttk.Label(conditions_frame, text="Fluid-set slot (0–7):").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Spinbox(conditions_frame, from_=0, to=7, textvariable=self.fluidset_var, width=5).grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
+        ttk.Label(conditions_frame, text="Expected gas:").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(conditions_frame, textvariable=self.expected_gas_var, width=16).grid(row=1, column=3, sticky="w", padx=(6, 12), pady=(8, 0))
+        ttk.Button(conditions_frame, text="Activate selected fluid set", command=self._activate_fluidset).grid(row=1, column=4, sticky="w", pady=(8, 0))
+        condition_fields = (("Inlet, bar(a)", self.inlet_pressure_var), ("Outlet, bar(a)", self.outlet_pressure_var), ("Fluid temp, °C", self.fluid_temperature_var), ("Volume reference, bar(a)", self.reference_pressure_var))
+        for column, (label, variable) in enumerate(condition_fields):
+            ttk.Label(conditions_frame, text=label).grid(row=2, column=column * 2, sticky="w", pady=(8, 0))
+            ttk.Entry(conditions_frame, textvariable=variable, width=9).grid(row=2, column=column * 2 + 1, sticky="w", padx=(6, 12), pady=(8, 0))
+        ttk.Button(conditions_frame, text="Save active fluid-set conditions", command=self._apply_fluid_conditions).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(conditions_frame, text="Stored fluid-set conditions, not live pressure/temperature measurements.", foreground="#6b4f00").grid(row=3, column=2, columnspan=6, sticky="w", pady=(8, 0))
         plan_frame = ttk.LabelFrame(body, text="Experiment: fixed H₂:alkene ratio, total-flow ramp", padding=8)
         plan_frame.pack(fill="x", pady=(12, 0))
         fields = (("Total from", "start"), ("to", "stop"), ("step", "step"), ("H₂ : alkene", "ratio"), ("Dwell / point, s", "dwell"))
@@ -380,6 +473,12 @@ class GasLineApp(tk.Tk):
 
     def _update_devices(self, devices: list[DeviceInfo]) -> None:
         self.devices = {device.serial_number: device for device in devices}
+        mismatches: list[str] = []
+        for device in devices:
+            profile = self.store.fluid_profiles.get(device.serial_number, {}).get(str(device.fluidset_index), {})
+            expected = str(profile.get("expected_gas", "")).strip()
+            if expected and expected.casefold() != device.fluid_name.casefold():
+                mismatches.append(f"{device.serial_number}: expected gas '{expected}', device reports '{device.fluid_name}'.")
         unseen = set(self.tree.get_children())
         for serial_number, device in self.devices.items():
             capacity = "unknown" if device.capacity is None else f"{device.capacity:.6g} {device.unit}"
@@ -403,10 +502,128 @@ class GasLineApp(tk.Tk):
             self.role_device_box.configure(state="disabled")
             self.role_device_var.set("No device detected")
             self.role_var.set("Unassigned")
+        selected = self.devices.get(self.role_device_var.get())
+        if selected is not None:
+            snapshot = self._condition_snapshot(selected)
+            if snapshot != self._conditions_snapshot:
+                self._load_role()
+        if mismatches:
+            self.port_warning_var.set("GAS PROFILE MISMATCH — do not start flow: " + " ".join(mismatches))
         self.status_var.set(f"Connected Bronkhorst devices: {len(serials)}. USB ports rescan every {self.store.discovery['scan_interval_s']:g} s.")
 
+    @staticmethod
+    def _condition_snapshot(device: DeviceInfo) -> tuple[Any, ...]:
+        return (
+            device.serial_number, device.fluid_name, device.fluidset_index,
+            device.inlet_pressure_bar_a, device.outlet_pressure_bar_a,
+            device.fluid_temperature_c, device.reference_pressure_bar_a,
+        )
+
     def _load_role(self, _event: object | None = None) -> None:
-        self.role_var.set(self.roles.get(self.role_device_var.get(), "Unassigned"))
+        serial_number = self.role_device_var.get()
+        self.role_var.set(self.roles.get(serial_number, "Unassigned"))
+        device = self.devices.get(serial_number)
+        if device is None:
+            self.fluid_conditions_var.set("Select a detected device to inspect its active gas calibration.")
+            self.fluidset_var.set("")
+            self.expected_gas_var.set("")
+            self.inlet_pressure_var.set("")
+            self.outlet_pressure_var.set("")
+            self.fluid_temperature_var.set("")
+            self.reference_pressure_var.set("")
+            self._conditions_snapshot = None
+            return
+        self._conditions_snapshot = self._condition_snapshot(device)
+        fluid_set = "unknown" if device.fluidset_index is None else str(device.fluidset_index)
+        inlet = "unknown" if device.inlet_pressure_bar_a is None else f"{device.inlet_pressure_bar_a:g} bar(a)"
+        outlet = "unknown" if device.outlet_pressure_bar_a is None else f"{device.outlet_pressure_bar_a:g} bar(a)"
+        temperature = "unknown" if device.fluid_temperature_c is None else f"{device.fluid_temperature_c:g} °C"
+        reference = "unknown" if device.reference_pressure_bar_a is None else f"{device.reference_pressure_bar_a:g} bar(a)"
+        self.fluid_conditions_var.set(
+            f"Active fluid set {fluid_set}: {device.fluid_name}. Stored inlet {inlet}; outlet {outlet}; "
+            f"fluid temperature {temperature}; volume reference {reference}."
+        )
+        self.fluidset_var.set("" if device.fluidset_index is None else str(device.fluidset_index))
+        saved_profile = self.store.fluid_profiles.get(serial_number, {}).get(str(device.fluidset_index), {})
+        self.expected_gas_var.set(str(saved_profile.get("expected_gas", device.fluid_name)))
+        self.inlet_pressure_var.set("" if device.inlet_pressure_bar_a is None else f"{device.inlet_pressure_bar_a:g}")
+        self.outlet_pressure_var.set("" if device.outlet_pressure_bar_a is None else f"{device.outlet_pressure_bar_a:g}")
+        self.fluid_temperature_var.set("" if device.fluid_temperature_c is None else f"{device.fluid_temperature_c:g}")
+        self.reference_pressure_var.set("" if device.reference_pressure_bar_a is None else f"{device.reference_pressure_bar_a:g}")
+
+    def _parse_fluid_conditions(self) -> dict[str, float]:
+        try:
+            values = {
+                "inlet": float(self.inlet_pressure_var.get().replace(",", ".")),
+                "outlet": float(self.outlet_pressure_var.get().replace(",", ".")),
+                "temperature": float(self.fluid_temperature_var.get().replace(",", ".")),
+                "reference": float(self.reference_pressure_var.get().replace(",", ".")),
+            }
+        except ValueError as exc:
+            raise ValueError("Enter numeric fluid-set conditions: pressures in bar(a), temperature in °C.") from exc
+        if not all(math.isfinite(value) for value in values.values()) or values["inlet"] <= 0 or values["outlet"] <= 0 or values["reference"] <= 0:
+            raise ValueError("Pressures must be finite positive values in bar(a).")
+        return values
+
+    def _apply_fluid_conditions(self) -> None:
+        if not self.control_enabled.get():
+            messagebox.showwarning("Writes disabled", "Enable writing setpoints before updating stored fluid-set conditions.")
+            return
+        serial_number = self.role_device_var.get()
+        device = self.devices.get(serial_number)
+        if device is None:
+            messagebox.showwarning("No device", "Select a connected device first.")
+            return
+        try:
+            values = self._parse_fluid_conditions()
+        except ValueError as exc:
+            messagebox.showwarning("Invalid conditions", str(exc))
+            return
+        if not messagebox.askyesno(
+            "Confirm fluid-set conditions",
+            f"Store the displayed conditions for active fluid set {device.fluidset_index} ({device.fluid_name}) on {serial_number}?\n\n"
+            "These are gas-model conditions, not sensor calibration constants or live measurements.",
+        ):
+            return
+        try:
+            self.service.submit("set_fluid_conditions", {serial_number: values})
+            self.store.save_fluid_profile(serial_number, device.fluidset_index or 0, {"expected_gas": self.expected_gas_var.get().strip(), **values})
+            self.status_var.set(f"Fluid-set condition command acknowledged for {serial_number}; values will refresh shortly.")
+        except Exception as exc:
+            messagebox.showerror("Condition update failed", str(exc))
+
+    def _activate_fluidset(self) -> None:
+        if not self.control_enabled.get():
+            messagebox.showwarning("Writes disabled", "Enable writing setpoints before activating a fluid set.")
+            return
+        serial_number = self.role_device_var.get()
+        device = self.devices.get(serial_number)
+        if device is None:
+            messagebox.showwarning("No device", "Select a connected device first.")
+            return
+        try:
+            fluidset = int(self.fluidset_var.get())
+            if not 0 <= fluidset <= 7:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Invalid fluid-set slot", "Choose an integer slot from 0 to 7.")
+            return
+        expected = self.expected_gas_var.get().strip()
+        if not expected:
+            messagebox.showwarning("Expected gas required", "Enter the expected gas label before switching a fluid set.")
+            return
+        if not messagebox.askyesno(
+            "Activate fluid set",
+            f"Activate fluid-set slot {fluidset} on {serial_number}?\nExpected gas: {expected}\n\n"
+            "The active gas conversion model and range may change. Verify the gas label read back from the device before flowing gas.",
+        ):
+            return
+        try:
+            self.service.submit("activate_fluidset", {serial_number: fluidset})
+            self.store.save_fluid_profile(serial_number, fluidset, {"expected_gas": expected})
+            self.status_var.set(f"Fluid-set {fluidset} activation acknowledged. Waiting to read back and verify the device gas label…")
+        except Exception as exc:
+            messagebox.showerror("Fluid-set activation failed", str(exc))
 
     def _save_role(self) -> None:
         serial_number, role = self.role_device_var.get(), self.role_var.get()
@@ -427,6 +644,13 @@ class GasLineApp(tk.Tk):
             raise ValueError("H2 and alkene units differ; use matching standard-volume units.")
         if h2[0].capacity is None or alkene[0].capacity is None:
             raise ValueError("Could not read both capacities; writing is blocked.")
+        for device in (h2[0], alkene[0]):
+            profile = self.store.fluid_profiles.get(device.serial_number, {}).get(str(device.fluidset_index), {})
+            expected = str(profile.get("expected_gas", "")).strip()
+            if expected and expected.casefold() != device.fluid_name.casefold():
+                raise ValueError(
+                    f"Gas profile mismatch for {device.serial_number}: expected '{expected}', device reports '{device.fluid_name}'."
+                )
         return h2[0], alkene[0]
 
     def _current_plan(self) -> list[ExperimentPoint]:

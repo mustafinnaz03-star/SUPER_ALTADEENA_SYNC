@@ -14,5 +14,16 @@
     "include_non_usb": false,
     "slave_ids": [1, 2]
   },
-  "roles": {}
+  "roles": {},
+  "fluid_profiles": {
+    "DEVICE_SERIAL": {
+      "0": {
+        "expected_gas": "H2",
+        "inlet": 2.0,
+        "outlet": 1.0,
+        "temperature": 20.0,
+        "reference": 1.01325
+      }
+    }
+  }
 }
