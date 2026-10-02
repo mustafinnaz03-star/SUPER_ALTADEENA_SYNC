@@ -1,0 +1,18 @@
+{
+  "serial_defaults": {
+    "protocol": "propar",
+    "baudrate": 38400,
+    "bytesize": 8,
+    "parity": "N",
+    "stopbits": 1,
+    "timeout_s": 0.4
+  },
+  "discovery": {
+    "scan_interval_s": 2.0,
+    "probe_timeout_s": 0.12,
+    "ports": [],
+    "include_non_usb": false,
+    "slave_ids": [1, 2]
+  },
+  "roles": {}
+}
