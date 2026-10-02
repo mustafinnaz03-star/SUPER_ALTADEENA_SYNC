@@ -9,7 +9,7 @@
   },
   "discovery": {
     "scan_interval_s": 2.0,
-    "probe_timeout_s": 0.12,
+    "probe_timeout_s": 0.5,
     "ports": [],
     "include_non_usb": false,
     "slave_ids": [1, 2]
