@@ -1,6 +1,6 @@
 import unittest
 
-from bronkhorst_gui import build_plan, float_to_registers, registers_to_float, registers_to_text
+from bronkhorst_gui import build_plan, build_single_mfc_plan, float_to_registers, registers_to_float, registers_to_text
 
 
 class FlowProgramTests(unittest.TestCase):
@@ -17,6 +17,12 @@ class FlowProgramTests(unittest.TestCase):
     def test_rejects_non_aligned_endpoint(self):
         with self.assertRaises(ValueError):
             build_plan(start=10, stop=25, step=10, ratio=4, dwell_s=60)
+
+    def test_single_mfc_ramp_assigns_full_total_to_one_channel(self):
+        plan = build_single_mfc_plan(start=5, stop=20, step=5, dwell_s=2)
+        self.assertEqual([point.total_flow for point in plan], [5, 10, 15, 20])
+        self.assertEqual([point.h2_flow for point in plan], [5, 10, 15, 20])
+        self.assertEqual([point.alkene_flow for point in plan], [0, 0, 0, 0])
 
     def test_float_register_round_trip(self):
         value = 12.345

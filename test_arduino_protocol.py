@@ -64,6 +64,19 @@ class ArduinoExperimentTests(unittest.TestCase):
         self.assertEqual(service.commands[-1][0], "zero")
         self.assertEqual(set(service.commands[-1][1]), {"H2", "ALKENE"})
 
+    def test_single_mfc_runner_writes_and_zeroes_only_one_device(self):
+        service, events = FakeMFCService(), queue.Queue()
+        plan = [ExperimentPoint(1, 10, 10, 0, 0.001)]
+        runner = ExperimentRunner(service, plan, "MFC-ONLY", None, events)
+        runner.run()
+
+        self.assertEqual(service.commands[0], ("set", {"MFC-ONLY": 10}))
+        self.assertEqual(service.commands[-1], ("zero", {"MFC-ONLY": 10}))
+        received = []
+        while not events.empty():
+            received.append(events.get_nowait())
+        self.assertNotIn("runner_error", [kind for kind, _ in received])
+
 
 if __name__ == "__main__":
     unittest.main()

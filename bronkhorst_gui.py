@@ -122,6 +122,19 @@ def build_plan(start: float, stop: float, step: float, ratio: float, dwell_s: fl
     ]
 
 
+def build_single_mfc_plan(start: float, stop: float, step: float, dwell_s: float) -> list[ExperimentPoint]:
+    """Build an inclusive ramp for one MFC; every point is its full setpoint."""
+    if not all(math.isfinite(value) for value in (start, stop, step, dwell_s)):
+        raise ValueError("All plan values must be finite")
+    if start < 0 or stop < start or step <= 0 or dwell_s <= 0:
+        raise ValueError("Require 0 ≤ start ≤ stop and positive step and dwell time")
+    count = int(math.floor((stop - start) / step + 1e-9)) + 1
+    totals = [round(start + index * step, 9) for index in range(count)]
+    if not math.isclose(totals[-1], stop, abs_tol=1e-7):
+        raise ValueError("(stop − start) must be divisible by step")
+    return [ExperimentPoint(i + 1, total, total, 0.0, dwell_s) for i, total in enumerate(totals)]
+
+
 class ConfigStore:
     def __init__(self, path: Path):
         self.path = path
@@ -653,7 +666,7 @@ class ArduinoNMRService(threading.Thread):
 
 
 class ExperimentRunner(threading.Thread):
-    def __init__(self, service: SerialService, plan: list[ExperimentPoint], h2_serial: str, alkene_serial: str, events: queue.Queue[tuple[str, Any]], arduino: ArduinoNMRService | None = None, arduino_timeout_s: float = 180.0):
+    def __init__(self, service: SerialService, plan: list[ExperimentPoint], h2_serial: str, alkene_serial: str | None, events: queue.Queue[tuple[str, Any]], arduino: ArduinoNMRService | None = None, arduino_timeout_s: float = 180.0):
         super().__init__(daemon=True)
         self.service, self.plan, self.h2_serial, self.alkene_serial, self.events = service, plan, h2_serial, alkene_serial, events
         self.arduino, self.arduino_timeout_s = arduino, arduino_timeout_s
@@ -664,12 +677,16 @@ class ExperimentRunner(threading.Thread):
         self.cancelled.set()
 
     def run(self) -> None:
-        controlled = {self.h2_serial: 0.0, self.alkene_serial: 0.0}
+        controlled = {self.h2_serial: 0.0}
+        if self.alkene_serial is not None:
+            controlled[self.alkene_serial] = 0.0
         try:
             for point in self.plan:
                 if self.cancelled.is_set():
                     raise InterruptedError("Stopped by operator")
-                controlled = {self.h2_serial: point.h2_flow, self.alkene_serial: point.alkene_flow}
+                controlled = {self.h2_serial: point.h2_flow}
+                if self.alkene_serial is not None:
+                    controlled[self.alkene_serial] = point.alkene_flow
                 self.service.submit("set", controlled)
                 started = time.monotonic()
                 self.events.put(("stage", (point, started)))
@@ -688,7 +705,8 @@ class ExperimentRunner(threading.Thread):
                         timeout_s=self.arduino_timeout_s + 10,
                     )
                     self.events.put(("spectrum_confirmed", point))
-            self.events.put(("finished", "Plan complete; setting both controlled channels to zero."))
+            channel_text = "both controlled channels" if self.alkene_serial is not None else "the controlled MFC"
+            self.events.put(("finished", f"Plan complete; setting {channel_text} to zero."))
         except Exception as exc:
             self.events.put(("runner_error", str(exc)))
         finally:
@@ -744,7 +762,13 @@ class ExperimentPlot(tk.Canvas):
             self.create_line(x, top + chart_height, x, top + chart_height + 4, fill="#64748b")
             self.create_text(x, top + chart_height + 16, text=f"{elapsed:g}", fill="#475569", font=("Segoe UI", 8))
         self.create_text(left + chart_width / 2, height - 10, text="Time, s", fill="#334155", font=("Segoe UI", 9))
-        series = (("H₂ setpoint", "#2563eb", [point.h2_flow for point in self.plan]), ("Alkene setpoint", "#d97706", [point.alkene_flow for point in self.plan]))
+        primary = self.devices.get(self.h2_serial or "")
+        primary_label = "MFC setpoint" if self.alkene_serial is None else "H₂ setpoint"
+        if self.alkene_serial is None and primary is not None:
+            primary_label = f"{primary.serial_number} setpoint"
+        series: list[tuple[str, str, list[float]]] = [(primary_label, "#2563eb", [point.h2_flow for point in self.plan])]
+        if self.alkene_serial is not None:
+            series.append(("Alkene setpoint", "#d97706", [point.alkene_flow for point in self.plan]))
         for series_index, (label, color, values) in enumerate(series):
             coordinates: list[float] = []
             elapsed = 0.0
@@ -998,11 +1022,16 @@ class GasLineApp(tk.Tk):
         self.plan_frame.pack(fill="x", pady=(12, 0))
         fields = (("Total from", "start"), ("to", "stop"), ("step", "step"), ("H₂ : alkene", "ratio"), ("Dwell / point, s", "dwell"))
         self.plan_input_widgets: list[ttk.Entry] = []
+        self.plan_field_labels: dict[str, ttk.Label] = {}
+        self.plan_field_entries: dict[str, ttk.Entry] = {}
         for i, (label, key) in enumerate(fields):
-            ttk.Label(self.plan_frame, text=label).grid(row=0, column=i * 2, sticky="w", padx=(0, 4))
+            label_widget = ttk.Label(self.plan_frame, text=label)
+            label_widget.grid(row=0, column=i * 2, sticky="w", padx=(0, 4))
             entry = ttk.Entry(self.plan_frame, textvariable=self.plan_vars[key], width=9)
             entry.grid(row=0, column=i * 2 + 1, sticky="w", padx=(0, 12))
             self.plan_input_widgets.append(entry)
+            self.plan_field_labels[key] = label_widget
+            self.plan_field_entries[key] = entry
         self.validate_plan_button = ttk.Button(self.plan_frame, text="Validate plan", command=self._validate_plan)
         self.validate_plan_button.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(self.plan_frame, textvariable=self.plan_var, wraplength=850).grid(row=1, column=2, columnspan=8, sticky="w", pady=(8, 0))
@@ -1091,6 +1120,7 @@ class GasLineApp(tk.Tk):
     def _update_operation_mode_controls(self) -> None:
         automatic = self.operation_mode.get() in {"automatic", "automatic-arduino"}
         arduino_mode = self.operation_mode.get() == "automatic-arduino"
+        single_mfc = self._single_mfc_automatic_setup()
         if automatic:
             self.manual_frame.pack_forget()
             if not self.start_experiment_button.winfo_manager():
@@ -1114,8 +1144,23 @@ class GasLineApp(tk.Tk):
             self.auto_controls.pack_forget()
             self.manual_frame.pack_forget()
             self.manual_frame.pack(fill="both", expand=True, pady=(12, 0), before=self.progress_label)
+        ratio_label = self.plan_field_labels["ratio"]
+        ratio_entry = self.plan_field_entries["ratio"]
+        if automatic and single_mfc:
+            ratio_label.grid_remove()
+            ratio_entry.grid_remove()
+            self.plan_frame.configure(text="Experiment: one MFC, total-flow ramp")
+            self.stop_experiment_button.configure(text="STOP and set MFC to zero")
+        else:
+            ratio_label.grid()
+            ratio_entry.grid()
+            self.plan_frame.configure(text="Experiment: fixed H₂:alkene ratio, total-flow ramp")
+            self.stop_experiment_button.configure(text="STOP and set H₂/alkene to zero")
         for widget in self.plan_input_widgets:
-            widget.configure(state="normal" if automatic else "disabled")
+            if widget is ratio_entry and single_mfc:
+                widget.configure(state="disabled")
+            else:
+                widget.configure(state="normal" if automatic else "disabled")
         for widget in (self.validate_plan_button, self.start_experiment_button, self.stop_experiment_button):
             widget.configure(state="normal" if automatic else "disabled")
 
@@ -1126,9 +1171,11 @@ class GasLineApp(tk.Tk):
                 and serial_number not in self.manual_commands_pending
             )
         if arduino_mode:
-            self.operation_mode_hint.set("Each point waits for purge/stabilization, then Arduino sends the NMR TTL; the next point is blocked until the matching return TTL confirms a spectrum.")
+            base = "The one connected MFC receives the full total-flow setpoint." if single_mfc else "The controller follows the validated H₂:alkene plan."
+            self.operation_mode_hint.set(base + " Each point waits for purge/stabilization, then Arduino sends the NMR TTL; the next point is blocked until the matching return TTL confirms a spectrum.")
         elif automatic:
-            self.operation_mode_hint.set("The controller will apply every validated point in sequence. Manual setpoints are disabled.")
+            base = "The one connected MFC receives the full total-flow setpoint." if single_mfc else "The controller will apply every validated H₂:alkene point in sequence."
+            self.operation_mode_hint.set(base + " Manual setpoints are disabled.")
         elif self.devices:
             self.operation_mode_hint.set("Задавайте поток в карточке нужного MFC. Кнопки «Установить» и «Ноль» отправляют команду сразу.")
         else:
@@ -1484,15 +1531,34 @@ class GasLineApp(tk.Tk):
         if h2[0].capacity is None or alkene[0].capacity is None:
             raise ValueError("Could not read both capacities; writing is blocked.")
         for device in (h2[0], alkene[0]):
-            if self.device_modes.get(device.serial_number, "Read flow") != "Set flow":
-                raise ValueError(f"{device.serial_number} is in Read flow mode; choose Set flow before starting the plan.")
-            profile = self.store.fluid_profiles.get(device.serial_number, {}).get(str(device.fluidset_index), {})
-            expected = str(profile.get("expected_gas", "")).strip()
-            if expected and expected.casefold() != device.fluid_name.casefold():
-                raise ValueError(
-                    f"Gas profile mismatch for {device.serial_number}: expected '{expected}', device reports '{device.fluid_name}'."
-                )
+            self._validate_automatic_device(device)
         return h2[0], alkene[0]
+
+    def _validate_automatic_device(self, device: DeviceInfo) -> None:
+        if device.capacity is None:
+            raise ValueError(f"Could not read capacity for {device.serial_number}; writing is blocked.")
+        if self.device_modes.get(device.serial_number, "Read flow") != "Set flow":
+            raise ValueError(f"{device.serial_number} is in Read flow mode; choose Set flow before starting the plan.")
+        profile = self.store.fluid_profiles.get(device.serial_number, {}).get(str(device.fluidset_index), {})
+        expected = str(profile.get("expected_gas", "")).strip()
+        if expected and expected.casefold() != device.fluid_name.casefold():
+            raise ValueError(
+                f"Gas profile mismatch for {device.serial_number}: expected '{expected}', device reports '{device.fluid_name}'."
+            )
+
+    def _experiment_devices(self) -> tuple[DeviceInfo, DeviceInfo | None]:
+        """Return one controlled MFC or the normal H2/alkene pair."""
+        if len(self.devices) == 1:
+            device = next(iter(self.devices.values()))
+            self._validate_automatic_device(device)
+            return device, None
+        if not self.devices:
+            raise ValueError("Connect one MFC for a single-device ramp, or connect the H2 and alkene MFCs.")
+        h2, alkene = self._role_devices()
+        return h2, alkene
+
+    def _single_mfc_automatic_setup(self) -> bool:
+        return len(self.devices) == 1
 
     def _redraw_experiment_view(self) -> None:
         if self.flow_plot is None or not self.flow_plot.winfo_exists():
@@ -1524,10 +1590,17 @@ class GasLineApp(tk.Tk):
         self.graph_window = None
         self.flow_plot = None
 
-    def _show_plan(self, plan: list[ExperimentPoint], h2: DeviceInfo, alkene: DeviceInfo) -> None:
+    def _show_plan(self, plan: list[ExperimentPoint], h2: DeviceInfo, alkene: DeviceInfo | None) -> None:
         self.active_plan = list(plan)
-        self.plan_h2_serial, self.plan_alkene_serial = h2.serial_number, alkene.serial_number
+        self.plan_h2_serial = h2.serial_number
+        self.plan_alkene_serial = None if alkene is None else alkene.serial_number
         self.current_plan_point = None
+        if alkene is None:
+            self.schedule_tree["displaycolumns"] = ("point", "total", "h2", "dwell")
+            self.schedule_tree.heading("h2", text=f"MFC {h2.serial_number} setpoint")
+        else:
+            self.schedule_tree["displaycolumns"] = ("point", "total", "h2", "alkene", "dwell")
+            self.schedule_tree.heading("h2", text="H₂ setpoint")
         for item in self.schedule_tree.get_children():
             self.schedule_tree.delete(item)
         for point in plan:
@@ -1589,11 +1662,14 @@ class GasLineApp(tk.Tk):
         except Exception as exc:
             self.events.put(("manual_setpoint_error", (serial_number, str(exc))))
 
-    def _current_plan(self) -> list[ExperimentPoint]:
+    def _current_plan(self, single_mfc: bool) -> list[ExperimentPoint]:
         try:
-            values = {key: float(variable.get().replace(",", ".")) for key, variable in self.plan_vars.items()}
+            required = ("start", "stop", "step", "dwell") if single_mfc else ("start", "stop", "step", "ratio", "dwell")
+            values = {key: float(self.plan_vars[key].get().replace(",", ".")) for key in required}
         except ValueError as exc:
             raise ValueError("Plan values must be numbers") from exc
+        if single_mfc:
+            return build_single_mfc_plan(values["start"], values["stop"], values["step"], values["dwell"])
         return build_plan(values["start"], values["stop"], values["step"], values["ratio"], values["dwell"])
 
     def _validate_plan(self) -> list[ExperimentPoint] | None:
@@ -1601,14 +1677,19 @@ class GasLineApp(tk.Tk):
             self.plan_var.set("Select Automatic mode to validate a scheduled plan.")
             return None
         try:
-            plan = self._current_plan()
-            h2, alkene = self._role_devices()
+            h2, alkene = self._experiment_devices()
+            plan = self._current_plan(alkene is None)
             last = plan[-1]
-            if last.h2_flow > h2.capacity + 1e-7 or last.alkene_flow > alkene.capacity + 1e-7:
+            if alkene is None and last.total_flow > h2.capacity + 1e-7:
+                raise ValueError(f"Final point exceeds capacity: {last.total_flow:.6g}/{h2.capacity:.6g} {h2.unit}")
+            if alkene is not None and (last.h2_flow > h2.capacity + 1e-7 or last.alkene_flow > alkene.capacity + 1e-7):
                 raise ValueError(f"Final point exceeds capacity: H2 {last.h2_flow:.6g}/{h2.capacity:.6g}, alkene {last.alkene_flow:.6g}/{alkene.capacity:.6g} {h2.unit}")
             seconds = sum(point.dwell_s for point in plan)
             self._show_plan(plan, h2, alkene)
-            self.plan_var.set(f"{len(plan)} points, {plan[0].total_flow:g}–{plan[-1].total_flow:g} {h2.unit}; {seconds / 60:g} min. Capacities are safe.")
+            if alkene is None:
+                self.plan_var.set(f"Single MFC {h2.serial_number}: {len(plan)} points, {plan[0].total_flow:g}–{plan[-1].total_flow:g} {h2.unit}; {seconds / 60:g} min. Capacity is safe.")
+            else:
+                self.plan_var.set(f"{len(plan)} points, {plan[0].total_flow:g}–{plan[-1].total_flow:g} {h2.unit}; {seconds / 60:g} min. Capacities are safe.")
             return plan
         except Exception as exc:
             self.plan_var.set("Plan error: " + str(exc))
@@ -1631,7 +1712,7 @@ class GasLineApp(tk.Tk):
         plan = self._validate_plan()
         if plan is None:
             return
-        h2, alkene = self._role_devices()
+        h2, alkene = self._experiment_devices()
         arduino_mode = self.operation_mode.get() == "automatic-arduino"
         timeout_s = 180.0
         if arduino_mode:
@@ -1651,10 +1732,20 @@ class GasLineApp(tk.Tk):
                 return
             timeout_s = arduino_settings["spectrum_timeout_s"]
         extra = "\nEvery point will wait for a matching Arduino/NMR TTL confirmation before the next point." if arduino_mode else ""
-        if not messagebox.askyesno("Start experiment", f"Start {len(plan)} points at H2:alkene = {self.plan_vars['ratio'].get()}?\nBoth controlled channels are zeroed when stopped or complete.{extra}"):
+        if alkene is None:
+            prompt = (
+                f"Start {len(plan)} points on MFC {h2.serial_number}?\n"
+                f"It will receive the complete setpoint at every point and will be set to zero when stopped or complete.{extra}"
+            )
+        else:
+            prompt = (
+                f"Start {len(plan)} points at H2:alkene = {self.plan_vars['ratio'].get()}?\n"
+                f"Both controlled channels are zeroed when stopped or complete.{extra}"
+            )
+        if not messagebox.askyesno("Start experiment", prompt):
             return
         self.runner = ExperimentRunner(
-            self.service, plan, h2.serial_number, alkene.serial_number, self.events,
+            self.service, plan, h2.serial_number, None if alkene is None else alkene.serial_number, self.events,
             arduino=self.arduino if arduino_mode else None,
             arduino_timeout_s=timeout_s,
         )
@@ -1668,7 +1759,8 @@ class GasLineApp(tk.Tk):
         if not self.runner or not self.runner.is_alive():
             messagebox.showinfo("No active experiment", "No scheduled experiment is running.")
             return
-        if messagebox.askyesno("Stop experiment", "Stop and command zero flow to the H2 and alkene channels?"):
+        target = "the controlled MFC" if self.plan_alkene_serial is None else "the H2 and alkene channels"
+        if messagebox.askyesno("Stop experiment", f"Stop and command zero flow to {target}?"):
             self.runner.cancel()
             self.progress_var.set("Stopping; requesting zero setpoints…")
 
@@ -1680,12 +1772,18 @@ class GasLineApp(tk.Tk):
                     self._update_devices(payload)
                 elif kind == "stage":
                     point, _ = payload
-                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {point.number}: H2={point.h2_flow:g}, alkene={point.alkene_flow:g}, dwell={point.dwell_s:g} s")
+                    if self.plan_alkene_serial is None:
+                        self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {point.number}: MFC={point.total_flow:g}, dwell={point.dwell_s:g} s")
+                    else:
+                        self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {point.number}: H2={point.h2_flow:g}, alkene={point.alkene_flow:g}, dwell={point.dwell_s:g} s")
                     self.current_plan_point = point.number
                     self.schedule_tree.selection_set(f"point-{point.number}")
                     self.schedule_tree.see(f"point-{point.number}")
                     self._redraw_experiment_view()
-                    self.progress_var.set(f"Point {point.number}: total {point.total_flow:g}; H2 {point.h2_flow:g}; alkene {point.alkene_flow:g}. Holding {point.dwell_s:g} s.")
+                    if self.plan_alkene_serial is None:
+                        self.progress_var.set(f"Point {point.number}: MFC setpoint {point.total_flow:g}. Holding {point.dwell_s:g} s.")
+                    else:
+                        self.progress_var.set(f"Point {point.number}: total {point.total_flow:g}; H2 {point.h2_flow:g}; alkene {point.alkene_flow:g}. Holding {point.dwell_s:g} s.")
                 elif kind == "progress":
                     number, elapsed, dwell = payload
                     self.progress_var.set(f"Point {number}: stabilization {elapsed:.0f}/{dwell:.0f} s")
@@ -1774,7 +1872,10 @@ class GasLineApp(tk.Tk):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("config.json"))
+    # Resolve the bundled configuration beside this script rather than from
+    # the shell's current directory. This keeps the normal VS Code/PowerShell
+    # launch command working from the workspace root.
+    parser.add_argument("--config", type=Path, default=Path(__file__).resolve().with_name("config.json"))
     args = parser.parse_args()
     try:
         store = ConfigStore(args.config)
