@@ -21,6 +21,7 @@ from tkinter import messagebox, ttk
 from typing import Any
 
 import propar
+import serial
 from serial.tools import list_ports
 
 
@@ -32,6 +33,10 @@ INLET_PRESSURE, OUTLET_PRESSURE, FLUID_TEMPERATURE = 178, 179, 181
 REFERENCE_PRESSURE = 246
 ROLES = ("Unassigned", "H2", "Alkene", "Other")
 MFC_MODES = ("Read flow", "Set flow")
+OPERATION_MODES = ("automatic", "automatic-arduino", "manual")
+ARDUINO_READY = "READY"
+ARDUINO_TRIGGERED = "TRIGGERED"
+ARDUINO_NMR_DONE = "NMR_DONE"
 
 # A busy COM port is an expected state during discovery (for example when
 # FlowSuite is open). It is reported in the GUI rather than printed repeatedly.
@@ -71,6 +76,15 @@ class ServiceCommand:
     payload: dict[str, Any] | None = None
     done: threading.Event | None = None
     error: Exception | None = None
+
+
+@dataclass
+class ArduinoCommand:
+    name: str
+    payload: dict[str, Any] | None = None
+    done: threading.Event | None = None
+    error: Exception | None = None
+    result: Any = None
 
 
 def registers_to_float(registers: list[int]) -> float:
@@ -140,6 +154,17 @@ class ConfigStore:
             for serial, mode in self.raw.get("device_modes", {}).items()
             if str(mode) in MFC_MODES
         }
+        raw_arduino = self.raw.get("arduino", {})
+        self.arduino = {
+            "port": str(raw_arduino.get("port", "")),
+            "baudrate": int(raw_arduino.get("baudrate", 115200)),
+            "spectrum_timeout_s": float(raw_arduino.get("spectrum_timeout_s", 180.0)),
+            "startup_timeout_s": float(raw_arduino.get("startup_timeout_s", 8.0)),
+        }
+        if not 1200 <= self.arduino["baudrate"] <= 2_000_000:
+            raise ValueError("Invalid Arduino baudrate")
+        if not 1 <= self.arduino["spectrum_timeout_s"] <= 86_400 or not 1 <= self.arduino["startup_timeout_s"] <= 60:
+            raise ValueError("Invalid Arduino timeout")
         raw_profiles = self.raw.get("fluid_profiles", {})
         self.fluid_profiles: dict[str, dict[str, dict[str, Any]]] = {
             str(serial): {str(slot): dict(profile) for slot, profile in slots.items() if isinstance(profile, dict)}
@@ -159,6 +184,11 @@ class ConfigStore:
     def save_fluid_profile(self, serial_number: str, fluidset_index: int, profile: dict[str, Any]) -> None:
         self.fluid_profiles.setdefault(serial_number, {})[str(fluidset_index)] = dict(profile)
         self.raw["fluid_profiles"] = self.fluid_profiles
+        self.path.write_text(json.dumps(self.raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def save_arduino(self, settings: dict[str, Any]) -> None:
+        self.arduino = dict(settings)
+        self.raw["arduino"] = self.arduino
         self.path.write_text(json.dumps(self.raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
@@ -462,11 +492,173 @@ class SerialService(threading.Thread):
         self.commands.put(ServiceCommand("stop"))
 
 
+class ArduinoNMRService(threading.Thread):
+    """Owns the Arduino COM port and implements a correlated TTL handshake.
+
+    Protocol deliberately uses printable newline-delimited messages so it can
+    be inspected in Arduino Serial Monitor:
+      PC -> Arduino:  TRIGGER <run-id> <point>
+      Arduino -> PC:  TRIGGERED <run-id> <point>
+      Arduino -> PC:  NMR_DONE <run-id> <point>
+    A point is accepted only after the matching TRIGGERED and NMR_DONE lines.
+    """
+
+    def __init__(self, settings: dict[str, Any], events: queue.Queue[tuple[str, Any]]):
+        super().__init__(daemon=True)
+        self.settings = dict(settings)
+        self.events = events
+        self.commands: queue.Queue[ArduinoCommand] = queue.Queue()
+        self.stopping = threading.Event()
+        self.port: serial.Serial | None = None
+        self.ready = False
+
+    def _log(self, message: str) -> None:
+        self.events.put(("arduino_log", f"{time.strftime('%H:%M:%S')}  ARDUINO: {message}"))
+
+    def _status(self, message: str) -> None:
+        self.events.put(("arduino_status", message))
+
+    def _close_port(self) -> None:
+        self.ready = False
+        if self.port is not None:
+            try:
+                self.port.close()
+            except Exception:
+                pass
+        self.port = None
+
+    def _read_line(self) -> str | None:
+        if self.port is None:
+            return None
+        raw = self.port.readline()
+        if not raw:
+            return None
+        return raw.decode("utf-8", errors="replace").strip()
+
+    def _write_line(self, line: str) -> None:
+        if self.port is None or not self.port.is_open:
+            raise ConnectionError("Arduino COM port is not open")
+        self.port.write((line + "\n").encode("ascii"))
+        self.port.flush()
+        self._log(f"> {line}")
+
+    def _connect(self, settings: dict[str, Any]) -> None:
+        port = str(settings.get("port", "")).strip()
+        if not port:
+            raise ValueError("Choose an Arduino COM port")
+        baudrate = int(settings.get("baudrate", 115200))
+        startup_timeout = float(settings.get("startup_timeout_s", 8.0))
+        self._close_port()
+        self._status(f"Opening Arduino on {port} at {baudrate} baud…")
+        self._log(f"Opening {port} at {baudrate} baud.")
+        self.port = serial.Serial(port=port, baudrate=baudrate, timeout=0.1, write_timeout=1)
+        self.settings = {**self.settings, **settings, "port": port, "baudrate": baudrate}
+        deadline = time.monotonic() + startup_timeout
+        while time.monotonic() < deadline:
+            line = self._read_line()
+            if line is None:
+                continue
+            self._log(f"< {line}")
+            if line == ARDUINO_READY:
+                self.ready = True
+                self._status(f"Arduino ready on {port}. TTL handshake is armed.")
+                return
+        self._close_port()
+        raise TimeoutError(f"Arduino did not send '{ARDUINO_READY}' within {startup_timeout:g} s")
+
+    def _trigger_and_wait(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.ready:
+            raise ConnectionError("Arduino is not READY; connect it before starting automatic-arduino")
+        run_id = str(payload["run_id"])
+        point = int(payload["point"])
+        cancel_event = payload.get("cancel_event")
+        timeout_s = float(payload.get("timeout_s", self.settings["spectrum_timeout_s"]))
+        token = f"{run_id} {point}"
+        self._write_line(f"TRIGGER {token}")
+        self._status(f"Point {point}: TTL sent; waiting for Arduino acknowledgement and NMR TTL ({timeout_s:g} s timeout).")
+        acknowledged = False
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                try:
+                    self._write_line(f"ABORT {token}")
+                except Exception:
+                    pass
+                raise InterruptedError("Stopped while waiting for NMR acquisition TTL")
+            line = self._read_line()
+            if line is None:
+                continue
+            self._log(f"< {line}")
+            fields = line.split()
+            if len(fields) < 3:
+                continue
+            kind, received_run, received_point = fields[:3]
+            if received_run != run_id or received_point != str(point):
+                self._log(f"Ignoring stale or foreign Arduino message for {received_run} {received_point}.")
+                continue
+            if kind == ARDUINO_TRIGGERED:
+                acknowledged = True
+                self._status(f"Point {point}: Arduino confirmed the outgoing TTL; waiting for NMR TTL.")
+            elif kind == ARDUINO_NMR_DONE:
+                if not acknowledged:
+                    raise RuntimeError("Received NMR_DONE before matching TRIGGERED acknowledgement")
+                self._status(f"Point {point}: NMR TTL confirmed. Spectrum accepted.")
+                return {"run_id": run_id, "point": point}
+            elif kind == "ERROR":
+                raise RuntimeError(f"Arduino reported ERROR for point {point}")
+        raise TimeoutError(f"Point {point}: no matching NMR_DONE TTL within {timeout_s:g} s")
+
+    def _handle(self, command: ArduinoCommand) -> None:
+        try:
+            if command.name == "connect":
+                self._connect(command.payload or {})
+            elif command.name == "trigger":
+                command.result = self._trigger_and_wait(command.payload or {})
+            elif command.name == "disconnect":
+                self._close_port()
+                self._status("Arduino disconnected.")
+            elif command.name == "stop":
+                self.stopping.set()
+            else:
+                raise ValueError(f"Unknown Arduino command {command.name}")
+        except Exception as exc:
+            command.error = exc
+            self._status(f"Arduino error: {exc}")
+        finally:
+            if command.done:
+                command.done.set()
+
+    def submit(self, name: str, payload: dict[str, Any] | None = None, timeout_s: float = 12) -> Any:
+        done = threading.Event()
+        command = ArduinoCommand(name, payload, done)
+        self.commands.put(command)
+        if not done.wait(timeout_s):
+            raise TimeoutError(f"Timed out waiting for Arduino {name}")
+        if command.error:
+            raise command.error
+        return command.result
+
+    def run(self) -> None:
+        try:
+            while not self.stopping.is_set():
+                try:
+                    self._handle(self.commands.get(timeout=0.05))
+                except queue.Empty:
+                    pass
+        finally:
+            self._close_port()
+
+    def shutdown(self) -> None:
+        self.commands.put(ArduinoCommand("stop"))
+
+
 class ExperimentRunner(threading.Thread):
-    def __init__(self, service: SerialService, plan: list[ExperimentPoint], h2_serial: str, alkene_serial: str, events: queue.Queue[tuple[str, Any]]):
+    def __init__(self, service: SerialService, plan: list[ExperimentPoint], h2_serial: str, alkene_serial: str, events: queue.Queue[tuple[str, Any]], arduino: ArduinoNMRService | None = None, arduino_timeout_s: float = 180.0):
         super().__init__(daemon=True)
         self.service, self.plan, self.h2_serial, self.alkene_serial, self.events = service, plan, h2_serial, alkene_serial, events
+        self.arduino, self.arduino_timeout_s = arduino, arduino_timeout_s
         self.cancelled = threading.Event()
+        self.run_id = f"run-{int(time.time() * 1000)}"
 
     def cancel(self) -> None:
         self.cancelled.set()
@@ -488,6 +680,14 @@ class ExperimentRunner(threading.Thread):
                         break
                 if self.cancelled.is_set():
                     raise InterruptedError("Stopped by operator")
+                if self.arduino is not None:
+                    self.events.put(("nmr_trigger_wait", point))
+                    self.arduino.submit(
+                        "trigger",
+                        {"run_id": self.run_id, "point": point.number, "cancel_event": self.cancelled, "timeout_s": self.arduino_timeout_s},
+                        timeout_s=self.arduino_timeout_s + 10,
+                    )
+                    self.events.put(("spectrum_confirmed", point))
             self.events.put(("finished", "Plan complete; setting both controlled channels to zero."))
         except Exception as exc:
             self.events.put(("runner_error", str(exc)))
@@ -620,11 +820,19 @@ class GasLineApp(tk.Tk):
         self.roles = dict(store.roles)
         self.device_modes = dict(store.device_modes)
         self.service = SerialService(store.serial, store.discovery, self.events)
+        default_arduino = {"port": "", "baudrate": 115200, "spectrum_timeout_s": 180.0, "startup_timeout_s": 8.0}
+        self.arduino_settings = {**default_arduino, **getattr(store, "arduino", {})}
+        self.arduino = ArduinoNMRService(self.arduino_settings, self.events)
         self.runner: ExperimentRunner | None = None
         self.control_enabled = tk.BooleanVar(value=False)
         self.operation_mode = tk.StringVar(value="automatic")
         self.operation_mode_hint = tk.StringVar()
         self.available_port_var = tk.StringVar(value="")
+        self.arduino_port_var = tk.StringVar(value=str(self.arduino_settings["port"]))
+        self.arduino_baudrate_var = tk.StringVar(value=str(self.arduino_settings["baudrate"]))
+        self.arduino_timeout_var = tk.StringVar(value=str(self.arduino_settings["spectrum_timeout_s"]))
+        self.arduino_status_var = tk.StringVar(value="Arduino is not connected.")
+        self.arduino_connecting = False
         self.manual_cards: dict[str, ManualFlowCard] = {}
         self.role_device_var, self.role_var = tk.StringVar(value="No device detected"), tk.StringVar(value="Unassigned")
         self.device_mode_var = tk.StringVar(value="Read flow")
@@ -653,6 +861,7 @@ class GasLineApp(tk.Tk):
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.service.start()
+        self.arduino.start()
         self._refresh_available_ports()
         self.after(100, self._consume_events)
 
@@ -682,12 +891,39 @@ class GasLineApp(tk.Tk):
         ).pack(anchor="w")
         ttk.Radiobutton(
             mode_frame,
+            text="Automatic + Arduino/NMR — require a confirmed spectrum for every point",
+            variable=self.operation_mode,
+            value="automatic-arduino",
+            command=self._operation_mode_changed,
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Radiobutton(
+            mode_frame,
             text="Manual — individual flow controls for each connected MFC",
             variable=self.operation_mode,
             value="manual",
             command=self._operation_mode_changed,
         ).pack(anchor="w", pady=(4, 0))
         ttk.Label(mode_frame, textvariable=self.operation_mode_hint, foreground="#4b5563", wraplength=850).pack(anchor="w", pady=(6, 0))
+
+        self.arduino_frame = ttk.LabelFrame(experiment_tab, text="Arduino / NMR TTL handshake", padding=8)
+        arduino_row = ttk.Frame(self.arduino_frame)
+        arduino_row.pack(fill="x")
+        ttk.Label(arduino_row, text="Arduino COM:").pack(side="left")
+        self.arduino_port_box = ttk.Combobox(arduino_row, textvariable=self.arduino_port_var, state="readonly", width=12)
+        self.arduino_port_box.pack(side="left", padx=(6, 12))
+        ttk.Label(arduino_row, text="Baud:").pack(side="left")
+        ttk.Entry(arduino_row, textvariable=self.arduino_baudrate_var, width=9).pack(side="left", padx=(6, 12))
+        ttk.Label(arduino_row, text="NMR timeout, s:").pack(side="left")
+        ttk.Entry(arduino_row, textvariable=self.arduino_timeout_var, width=7).pack(side="left", padx=(6, 12))
+        self.arduino_connect_button = ttk.Button(arduino_row, text="Connect Arduino", command=self._connect_arduino)
+        self.arduino_connect_button.pack(side="left")
+        ttk.Button(arduino_row, text="Disconnect", command=self._disconnect_arduino).pack(side="left", padx=8)
+        ttk.Label(self.arduino_frame, textvariable=self.arduino_status_var, foreground="#4b5563", wraplength=850).pack(anchor="w", pady=(7, 0))
+        ttk.Label(
+            self.arduino_frame,
+            text="Required protocol: READY on connection; then TRIGGERED <run-id> <point> after the outgoing TTL and NMR_DONE <run-id> <point> only after the returning NMR TTL edge. Details are in README.",
+            foreground="#6b4f00", wraplength=850,
+        ).pack(anchor="w", pady=(4, 0))
 
         connect_frame = ttk.LabelFrame(connection_tab, text="Manual COM connection", padding=8)
         connect_frame.pack(fill="x", pady=(0, 10))
@@ -829,6 +1065,9 @@ class GasLineApp(tk.Tk):
         self.available_port_box["values"] = ports
         if self.available_port_var.get() not in ports:
             self.available_port_var.set(ports[0] if ports else "")
+        self.arduino_port_box["values"] = ports
+        if self.arduino_port_var.get() not in ports:
+            self.arduino_port_var.set(ports[0] if ports else "")
 
     def _refresh_available_ports(self) -> None:
         self._update_available_ports()
@@ -839,7 +1078,7 @@ class GasLineApp(tk.Tk):
         if self.operation_mode.get() == "manual" and self.runner and self.runner.is_alive():
             self.operation_mode.set("automatic")
             messagebox.showwarning("Experiment running", "Stop the automatic experiment before switching to manual control.")
-        elif self.operation_mode.get() == "automatic" and (
+        elif self.operation_mode.get() in {"automatic", "automatic-arduino"} and (
             self.manual_commands_pending or any(flow > 0 for flow in self.manual_setpoints.values())
         ):
             self.operation_mode.set("manual")
@@ -850,7 +1089,8 @@ class GasLineApp(tk.Tk):
         self._update_operation_mode_controls()
 
     def _update_operation_mode_controls(self) -> None:
-        automatic = self.operation_mode.get() == "automatic"
+        automatic = self.operation_mode.get() in {"automatic", "automatic-arduino"}
+        arduino_mode = self.operation_mode.get() == "automatic-arduino"
         if automatic:
             self.manual_frame.pack_forget()
             if not self.start_experiment_button.winfo_manager():
@@ -863,6 +1103,9 @@ class GasLineApp(tk.Tk):
                 self.plan_frame.pack(fill="x", pady=(12, 0), before=self.progress_label)
             if not self.plan_view_frame.winfo_manager():
                 self.plan_view_frame.pack(fill="both", expand=True, pady=(12, 0), before=self.progress_label)
+            self.arduino_frame.pack_forget()
+            if arduino_mode:
+                self.arduino_frame.pack(fill="x", pady=(12, 0), before=self.plan_frame)
             self.auto_controls.pack_forget()
             self.auto_controls.pack(fill="x", pady=8, before=self.plan_view_frame)
         else:
@@ -882,7 +1125,9 @@ class GasLineApp(tk.Tk):
                 and self.device_modes.get(serial_number, "Read flow") == "Set flow"
                 and serial_number not in self.manual_commands_pending
             )
-        if automatic:
+        if arduino_mode:
+            self.operation_mode_hint.set("Each point waits for purge/stabilization, then Arduino sends the NMR TTL; the next point is blocked until the matching return TTL confirms a spectrum.")
+        elif automatic:
             self.operation_mode_hint.set("The controller will apply every validated point in sequence. Manual setpoints are disabled.")
         elif self.devices:
             self.operation_mode_hint.set("Задавайте поток в карточке нужного MFC. Кнопки «Установить» и «Ноль» отправляют команду сразу.")
@@ -935,6 +1180,63 @@ class GasLineApp(tk.Tk):
             return
         self._append_connection_log(f"{time.strftime('%H:%M:%S')}  UI: disconnect button pressed for {port}.")
         threading.Thread(target=self._run_connection_command, args=("disconnect_port", port), daemon=True).start()
+
+    def _arduino_settings_from_ui(self) -> dict[str, Any]:
+        port = self.arduino_port_var.get().strip()
+        if not port:
+            raise ValueError("Choose the Arduino COM port")
+        try:
+            baudrate = int(self.arduino_baudrate_var.get().strip())
+            timeout_s = float(self.arduino_timeout_var.get().replace(",", "."))
+        except ValueError as exc:
+            raise ValueError("Arduino baud rate and NMR timeout must be numbers") from exc
+        if baudrate < 1200 or baudrate > 2_000_000:
+            raise ValueError("Arduino baud rate must be between 1200 and 2000000")
+        if timeout_s <= 0:
+            raise ValueError("NMR timeout must be positive")
+        return {
+            "port": port,
+            "baudrate": baudrate,
+            "spectrum_timeout_s": timeout_s,
+            "startup_timeout_s": float(self.arduino_settings.get("startup_timeout_s", 8.0)),
+        }
+
+    def _connect_arduino(self) -> None:
+        if self.runner and self.runner.is_alive():
+            messagebox.showwarning("Experiment running", "Stop the experiment before changing the Arduino connection.")
+            return
+        if self.arduino_connecting:
+            return
+        try:
+            settings = self._arduino_settings_from_ui()
+        except ValueError as exc:
+            messagebox.showwarning("Arduino settings", str(exc))
+            return
+        self.arduino_connecting = True
+        self.arduino_connect_button.configure(state="disabled")
+        self.arduino_status_var.set(f"Opening {settings['port']} and waiting for READY…")
+        self._append_connection_log(f"{time.strftime('%H:%M:%S')}  UI: Arduino connect requested for {settings['port']}.")
+        threading.Thread(target=self._run_arduino_connect, args=(settings,), daemon=True).start()
+
+    def _run_arduino_connect(self, settings: dict[str, Any]) -> None:
+        try:
+            self.arduino.submit("connect", settings, timeout_s=settings["startup_timeout_s"] + 3)
+            self.events.put(("arduino_connected", settings))
+        except Exception as exc:
+            self.events.put(("arduino_connection_error", str(exc)))
+
+    def _disconnect_arduino(self) -> None:
+        if self.runner and self.runner.is_alive():
+            messagebox.showwarning("Experiment running", "Stop the experiment before disconnecting the Arduino.")
+            return
+        threading.Thread(target=self._run_arduino_disconnect, daemon=True).start()
+
+    def _run_arduino_disconnect(self) -> None:
+        try:
+            self.arduino.submit("disconnect", timeout_s=4)
+            self.events.put(("arduino_disconnected", None))
+        except Exception as exc:
+            self.events.put(("arduino_connection_error", str(exc)))
 
     def _run_connection_command(self, action: str, port: str) -> None:
         try:
@@ -1295,7 +1597,7 @@ class GasLineApp(tk.Tk):
         return build_plan(values["start"], values["stop"], values["step"], values["ratio"], values["dwell"])
 
     def _validate_plan(self) -> list[ExperimentPoint] | None:
-        if self.operation_mode.get() != "automatic":
+        if self.operation_mode.get() not in {"automatic", "automatic-arduino"}:
             self.plan_var.set("Select Automatic mode to validate a scheduled plan.")
             return None
         try:
@@ -1317,7 +1619,7 @@ class GasLineApp(tk.Tk):
             self.control_enabled.set(False)
 
     def _start_experiment(self) -> None:
-        if self.operation_mode.get() != "automatic":
+        if self.operation_mode.get() not in {"automatic", "automatic-arduino"}:
             messagebox.showinfo("Manual mode", "Switch to Automatic mode before starting the scheduled experiment.")
             return
         if not self.control_enabled.get():
@@ -1330,14 +1632,37 @@ class GasLineApp(tk.Tk):
         if plan is None:
             return
         h2, alkene = self._role_devices()
-        if not messagebox.askyesno("Start experiment", f"Start {len(plan)} points at H2:alkene = {self.plan_vars['ratio'].get()}?\nBoth controlled channels are zeroed when stopped or complete."):
+        arduino_mode = self.operation_mode.get() == "automatic-arduino"
+        timeout_s = 180.0
+        if arduino_mode:
+            if not self.arduino.ready:
+                messagebox.showwarning("Arduino not ready", "Connect the Arduino and wait for its READY status before starting automatic-arduino.")
+                return
+            try:
+                arduino_settings = self._arduino_settings_from_ui()
+            except ValueError as exc:
+                messagebox.showwarning("Arduino settings", str(exc))
+                return
+            if (
+                arduino_settings["port"] != self.arduino.settings.get("port")
+                or arduino_settings["baudrate"] != self.arduino.settings.get("baudrate")
+            ):
+                messagebox.showwarning("Arduino settings changed", "Connect Arduino again after changing its COM port or baud rate.")
+                return
+            timeout_s = arduino_settings["spectrum_timeout_s"]
+        extra = "\nEvery point will wait for a matching Arduino/NMR TTL confirmation before the next point." if arduino_mode else ""
+        if not messagebox.askyesno("Start experiment", f"Start {len(plan)} points at H2:alkene = {self.plan_vars['ratio'].get()}?\nBoth controlled channels are zeroed when stopped or complete.{extra}"):
             return
-        self.runner = ExperimentRunner(self.service, plan, h2.serial_number, alkene.serial_number, self.events)
+        self.runner = ExperimentRunner(
+            self.service, plan, h2.serial_number, alkene.serial_number, self.events,
+            arduino=self.arduino if arduino_mode else None,
+            arduino_timeout_s=timeout_s,
+        )
         self.runner.start()
         self.progress_var.set("Starting experiment…")
 
     def _stop_experiment(self) -> None:
-        if self.operation_mode.get() != "automatic":
+        if self.operation_mode.get() not in {"automatic", "automatic-arduino"}:
             messagebox.showinfo("Manual mode", "Use 'Set selected channel to zero' to stop the manually selected MFC.")
             return
         if not self.runner or not self.runner.is_alive():
@@ -1364,6 +1689,12 @@ class GasLineApp(tk.Tk):
                 elif kind == "progress":
                     number, elapsed, dwell = payload
                     self.progress_var.set(f"Point {number}: stabilization {elapsed:.0f}/{dwell:.0f} s")
+                elif kind == "nmr_trigger_wait":
+                    self.progress_var.set(f"Point {payload.number}: purge/stabilization complete; requesting Arduino TTL and waiting for NMR confirmation.")
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {payload.number}: requesting Arduino/NMR TTL handshake.")
+                elif kind == "spectrum_confirmed":
+                    self.progress_var.set(f"Point {payload.number}: NMR spectrum confirmed; continuing to the next point.")
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {payload.number}: Arduino confirmed returning NMR TTL; spectrum accepted.")
                 elif kind == "finished":
                     self._append_connection_log(f"{time.strftime('%H:%M:%S')}  {payload}")
                     self.progress_var.set(payload)
@@ -1385,6 +1716,27 @@ class GasLineApp(tk.Tk):
                 elif kind == "connection_error":
                     self.port_warning_var.set(payload)
                     self.status_var.set("Connection failed; see the Console tab for details.")
+                elif kind == "arduino_log":
+                    self._append_connection_log(payload)
+                elif kind == "arduino_status":
+                    self.arduino_status_var.set(payload)
+                elif kind == "arduino_connected":
+                    self.arduino_connecting = False
+                    self.arduino_connect_button.configure(state="normal")
+                    self.arduino_settings = dict(payload)
+                    if hasattr(self.store, "save_arduino"):
+                        self.store.save_arduino(self.arduino_settings)
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  UI: Arduino connected on {payload['port']}.")
+                elif kind == "arduino_disconnected":
+                    self.arduino_connecting = False
+                    self.arduino_connect_button.configure(state="normal")
+                    self.arduino_status_var.set("Arduino is not connected.")
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  UI: Arduino disconnected.")
+                elif kind == "arduino_connection_error":
+                    self.arduino_connecting = False
+                    self.arduino_connect_button.configure(state="normal")
+                    self.arduino_status_var.set("Arduino connection error: " + payload)
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  ARDUINO CONNECTION ERROR: {payload}")
                 elif kind == "manual_setpoint":
                     serial_number, flow = payload
                     self.manual_commands_pending.discard(serial_number)
@@ -1416,6 +1768,7 @@ class GasLineApp(tk.Tk):
         if self.runner and self.runner.is_alive():
             self.runner.cancel()
         self.service.shutdown()
+        self.arduino.shutdown()
         self.destroy()
 
 

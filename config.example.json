@@ -14,6 +14,12 @@
     "include_non_usb": false,
     "slave_ids": [1, 2]
   },
+  "arduino": {
+    "port": "",
+    "baudrate": 115200,
+    "spectrum_timeout_s": 180,
+    "startup_timeout_s": 8
+  },
   "roles": {},
   "device_modes": {},
   "fluid_profiles": {
