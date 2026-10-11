@@ -2,8 +2,9 @@
 
 import queue
 import unittest
+from unittest.mock import Mock
 
-from bronkhorst_gui import ExperimentPoint, ExperimentRunner
+from bronkhorst_gui import ArduinoNMRService, ExperimentPoint, ExperimentRunner
 
 
 class FakeMFCService:
@@ -29,6 +30,24 @@ class TimingOutArduino:
 
 
 class ArduinoExperimentTests(unittest.TestCase):
+    def test_console_reports_ttl_only_after_matching_acknowledgements(self):
+        events = queue.Queue()
+        service = ArduinoNMRService({"spectrum_timeout_s": 1}, events)
+        service.ready = True
+        service._write_line = Mock()
+        service._read_line = Mock(side_effect=["TRIGGERED old-run 1", "TRIGGERED run-test 1", "NMR_DONE run-test 1"])
+        service._trigger_and_wait({"run_id": "run-test", "point": 1})
+        log = []
+        while not events.empty():
+            kind, value = events.get_nowait()
+            if kind == "arduino_log":
+                log.append(value)
+        sent = [line for line in log if "подтвердила отправку TTL" in line]
+        received = [line for line in log if "получен ответный TTL" in line]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(received), 1)
+        self.assertLess(log.index(sent[0]), log.index(received[0]))
+
     def test_next_point_waits_for_confirmed_spectrum(self):
         service, arduino, events = FakeMFCService(), ConfirmingArduino(), queue.Queue()
         plan = [
