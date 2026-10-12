@@ -81,7 +81,8 @@ class ManualControlsTests(unittest.TestCase):
         self.app.device_modes["MFC-A"] = "Set flow"
         self.app._update_devices([device(), device("MFC-B", "COM_TEST_B")])
         self.app.update_idletasks()
-        self.assertEqual(self.app.plan_frame.winfo_manager(), "")
+        self.assertEqual(self.app.design_window.state(), "withdrawn")
+        self.assertIs(self.app.plan_frame.master, self.app.design_content)
         self.assertEqual(self.app.plan_view_frame.winfo_manager(), "")
         self.assertEqual(self.app.auto_controls.winfo_manager(), "")
         self.app._update_devices([device("MFC-B", "COM_TEST_B")])
@@ -89,7 +90,7 @@ class ManualControlsTests(unittest.TestCase):
         self.app._update_devices([])
         self.assertEqual(len(self.app.manual_cards), 0)
         self.assertEqual(self.app.manual_empty_label.winfo_manager(), "pack")
-        self.app.operation_mode.set("automatic")
+        self.app.operation_mode.set("automatic-arduino")
         self.app._operation_mode_changed()
         self.assertEqual(self.app.plan_frame.winfo_manager(), "pack")
         self.assertEqual(self.app.plan_view_frame.winfo_manager(), "pack")
@@ -134,7 +135,7 @@ class ManualControlsTests(unittest.TestCase):
             for item in self.app.flow_plot.find_all()
             if self.app.flow_plot.type(item) == "text"
         ]
-        self.assertIn("Время, с", texts)
+        self.assertIn("Сумма задержек t1–t4, с · время ЯМР не включено", texts)
         h2_line = next(
             item for item in self.app.flow_plot.find_all()
             if self.app.flow_plot.type(item) == "line" and self.app.flow_plot.itemcget(item, "fill") == "#2563eb"
@@ -215,12 +216,18 @@ class ManualControlsTests(unittest.TestCase):
         self.app.plan_vars["stop"].set("20")
         self.app.plan_vars["step"].set("5")
         plan = self.app._validate_plan()
-        for kind, payload in (("stage", (plan[0], 0)), ("nmr_trigger_wait", plan[0])):
+        for kind, payload in (("stage", (plan[0], 0)), ("nmr_trigger_wait", (plan[0], 1))):
             self.app.events.put((kind, payload))
         self.app._consume_events()
-        self.assertEqual(self.app.schedule_tree.set("point-1", "status"), "Ожидание ЯМР")
+        self.assertEqual(self.app.schedule_tree.set("point-1", "status"), "ЯМР 1/2: ожидание TTL")
         self.assertEqual(float(self.app.run_progress["value"]), 0)
-        self.app.events.put(("spectrum_confirmed", plan[0]))
+        self.app.events.put(("spectrum_confirmed", (plan[0], 1)))
+        self.app._consume_events()
+        self.assertEqual(float(self.app.run_progress["value"]), 0)
+        self.app.events.put(("spectrum_confirmed", (plan[0], 2)))
+        self.app._consume_events()
+        self.assertEqual(float(self.app.run_progress["value"]), 0)
+        self.app.events.put(("point_completed", plan[0]))
         self.app._consume_events()
         self.assertEqual(float(self.app.run_progress["value"]), 25)
         self.app.events.put(("stage", (plan[1], 0)))
@@ -234,7 +241,7 @@ class ManualControlsTests(unittest.TestCase):
         self.app.update_idletasks()
         self.assertEqual(self.app.plan_frame.cget("text"), "План подачи газа")
         self.assertEqual(self.app.plan_field_entries["ratio"].winfo_manager(), "")
-        self.assertEqual(str(self.app.plan_field_entries["start"].cget("state")), "disabled")
+        self.assertEqual(str(self.app.plan_field_entries["start"].cget("state")), "normal")
         self.assertEqual(str(self.app.validate_plan_button.cget("state")), "disabled")
         self.assertEqual(str(self.app.start_experiment_button.cget("state")), "disabled")
         self.assertIn("сначала подключите хотя бы один MFC", self.app.operation_mode_hint.get())

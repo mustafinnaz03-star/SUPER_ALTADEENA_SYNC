@@ -60,9 +60,11 @@ class ArduinoExperimentTests(unittest.TestCase):
         event_kinds = []
         while not events.empty():
             event_kinds.append(events.get_nowait()[0])
-        self.assertEqual([call[1]["point"] for call in arduino.calls], [1, 2])
-        self.assertEqual(event_kinds.count("nmr_trigger_wait"), 2)
-        self.assertEqual(event_kinds.count("spectrum_confirmed"), 2)
+        self.assertEqual([call[1]["point"] for call in arduino.calls], [1, 1, 2, 2])
+        self.assertNotEqual(arduino.calls[0][1]["run_id"], arduino.calls[1][1]["run_id"])
+        self.assertEqual(event_kinds.count("nmr_trigger_wait"), 4)
+        self.assertEqual(event_kinds.count("spectrum_confirmed"), 4)
+        self.assertEqual(event_kinds.count("point_completed"), 2)
         self.assertNotIn("runner_error", event_kinds)
         self.assertEqual(service.commands[-1][0], "zero")
         self.assertEqual(set(service.commands[-1][1]), {"H2", "ALKENE"})

@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Bronkhorst GUI",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\bronkhorst_gui.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ]
+}

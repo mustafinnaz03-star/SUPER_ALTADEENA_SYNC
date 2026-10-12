@@ -12,6 +12,7 @@ import logging
 import math
 import queue
 import struct
+import sys
 import threading
 import time
 import tkinter as tk
@@ -19,12 +20,28 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any
+from uuid import uuid4
+
+# The project is distributed with a local virtual environment.  VS Code can
+# otherwise run a standalone file with its bundled Python (rather than the
+# interpreter selected for this workspace), which would not see ProPar.
+# Prefer the project packages whenever that environment is present; on an
+# installed deployment without .venv this loop has no effect.
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_PROJECT_VENV = _PROJECT_ROOT / ".venv"
+_VENV_PACKAGE_DIRS = [_PROJECT_VENV / "Lib" / "site-packages"]
+if (_PROJECT_VENV / "lib").is_dir():
+    _VENV_PACKAGE_DIRS.extend(sorted((_PROJECT_VENV / "lib").glob("python*/site-packages")))
+for _package_dir in _VENV_PACKAGE_DIRS:
+    if _package_dir.is_dir() and str(_package_dir) not in sys.path:
+        sys.path.insert(0, str(_package_dir))
 
 import propar
 import serial
 from serial.tools import list_ports
 
 from bronkhorst_ui import ROLE_LABELS, MODE_LABELS, build_interface, configure_style
+from experiment_cycle import AUTOMATIC_MODES, CYCLE_DEFAULTS, OPERATION_LABELS, CycleTiming, ValvePlaceholder
 
 
 # FlowDDE parameter numbers, used by the EL-FLOW RS232/FLOW-BUS (ProPar) interface.
@@ -35,7 +52,7 @@ INLET_PRESSURE, OUTLET_PRESSURE, FLUID_TEMPERATURE = 178, 179, 181
 REFERENCE_PRESSURE = 246
 ROLES = ("Unassigned", "H2", "Alkene", "Other")
 MFC_MODES = ("Read flow", "Set flow")
-OPERATION_MODES = ("automatic", "automatic-arduino", "manual")
+OPERATION_MODES = tuple(OPERATION_LABELS)
 ARDUINO_READY = "READY"
 ARDUINO_TRIGGERED = "TRIGGERED"
 ARDUINO_NMR_DONE = "NMR_DONE"
@@ -112,8 +129,8 @@ def build_plan(start: float, stop: float, step: float, ratio: float, dwell_s: fl
     values = (start, stop, step, ratio, dwell_s)
     if not all(math.isfinite(value) for value in values):
         raise ValueError("Параметры плана должны быть конечными числами")
-    if start < 0 or stop < start or step <= 0 or ratio <= 0 or dwell_s <= 0:
-        raise ValueError("Начальный поток: от 0 до конечного; шаг, соотношение и выдержка — больше нуля")
+    if start < 0 or stop < start or step <= 0 or ratio <= 0 or dwell_s < 0:
+        raise ValueError("Начальный поток: от 0 до конечного; шаг и соотношение — больше нуля; t1 — не меньше нуля")
     count = int(math.floor((stop - start) / step + 1e-9)) + 1
     totals = [round(start + index * step, 9) for index in range(count)]
     if not math.isclose(totals[-1], stop, abs_tol=1e-7):
@@ -128,8 +145,8 @@ def build_single_mfc_plan(start: float, stop: float, step: float, dwell_s: float
     """Build an inclusive ramp for one MFC; every point is its full setpoint."""
     if not all(math.isfinite(value) for value in (start, stop, step, dwell_s)):
         raise ValueError("Параметры плана должны быть конечными числами")
-    if start < 0 or stop < start or step <= 0 or dwell_s <= 0:
-        raise ValueError("Начальный поток: от 0 до конечного; шаг и выдержка — больше нуля")
+    if start < 0 or stop < start or step <= 0 or dwell_s < 0:
+        raise ValueError("Начальный поток: от 0 до конечного; шаг — больше нуля; t1 — не меньше нуля")
     count = int(math.floor((stop - start) / step + 1e-9)) + 1
     totals = [round(start + index * step, 9) for index in range(count)]
     if not math.isclose(totals[-1], stop, abs_tol=1e-7):
@@ -181,6 +198,7 @@ class ConfigStore:
         if not 1 <= self.arduino["spectrum_timeout_s"] <= 86_400 or not 1 <= self.arduino["startup_timeout_s"] <= 60:
             raise ValueError("Invalid Arduino timeout")
         raw_profiles = self.raw.get("fluid_profiles", {})
+        self.experiment = dict(self.raw.get("experiment", {}))
         self.fluid_profiles: dict[str, dict[str, dict[str, Any]]] = {
             str(serial): {str(slot): dict(profile) for slot, profile in slots.items() if isinstance(profile, dict)}
             for serial, slots in raw_profiles.items() if isinstance(slots, dict)
@@ -204,6 +222,11 @@ class ConfigStore:
     def save_arduino(self, settings: dict[str, Any]) -> None:
         self.arduino = dict(settings)
         self.raw["arduino"] = self.arduino
+        self.path.write_text(json.dumps(self.raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def save_experiment(self, settings: dict[str, float]) -> None:
+        self.experiment = dict(settings)
+        self.raw["experiment"] = self.experiment
         self.path.write_text(json.dumps(self.raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
@@ -670,15 +693,44 @@ class ArduinoNMRService(threading.Thread):
 
 
 class ExperimentRunner(threading.Thread):
-    def __init__(self, service: SerialService, plan: list[ExperimentPoint], h2_serial: str, alkene_serial: str | None, events: queue.Queue[tuple[str, Any]], arduino: ArduinoNMRService | None = None, arduino_timeout_s: float = 180.0):
+    def __init__(self, service: SerialService, plan: list[ExperimentPoint], h2_serial: str, alkene_serial: str | None, events: queue.Queue[tuple[str, Any]], arduino: ArduinoNMRService | None = None, arduino_timeout_s: float = 180.0, cycle: CycleTiming | None = None, valves: ValvePlaceholder | None = None):
         super().__init__(daemon=True)
         self.service, self.plan, self.h2_serial, self.alkene_serial, self.events = service, plan, h2_serial, alkene_serial, events
         self.arduino, self.arduino_timeout_s = arduino, arduino_timeout_s
+        self.cycle, self.valves = cycle, valves
         self.cancelled = threading.Event()
-        self.run_id = f"run-{int(time.time() * 1000)}"
+        self.run_id = f"run-{uuid4().hex[:16]}"
 
     def cancel(self) -> None:
         self.cancelled.set()
+
+    def _wait_delay(self, point: ExperimentPoint, name: str, seconds: float) -> None:
+        self.events.put(("cycle_stage", (point.number, name, seconds)))
+        started = time.monotonic()
+        while True:
+            if self.cancelled.is_set():
+                raise InterruptedError("Stopped by operator")
+            elapsed = min(time.monotonic() - started, seconds)
+            self.events.put(("cycle_progress", (point.number, name, elapsed, seconds)))
+            if elapsed >= seconds:
+                return
+            self.cancelled.wait(min(0.2, seconds - elapsed))
+
+    def _record_spectrum(self, point: ExperimentPoint, spectrum: int) -> None:
+        if self.cancelled.is_set():
+            raise InterruptedError("Stopped by operator")
+        self.events.put(("nmr_trigger_wait", (point, spectrum)))
+        # Each acquisition has a different protocol token. A late spectrum-1
+        # response cannot acknowledge spectrum 2; the existing sketch is compatible.
+        self.arduino.submit(
+            "trigger",
+            {"run_id": f"{self.run_id}-s{spectrum}", "point": point.number,
+             "cancel_event": self.cancelled, "timeout_s": self.arduino_timeout_s},
+            timeout_s=self.arduino_timeout_s + 10,
+        )
+        if self.cancelled.is_set():
+            raise InterruptedError("Stopped by operator")
+        self.events.put(("spectrum_confirmed", (point, spectrum)))
 
     def run(self) -> None:
         controlled = {self.h2_serial: 0.0}
@@ -686,6 +738,10 @@ class ExperimentRunner(threading.Thread):
             controlled[self.alkene_serial] = 0.0
         completed = False
         try:
+            if self.valves is not None and self.arduino is None:
+                raise ValueError("Valve mode requires the NMR/Arduino handshake")
+            if self.valves is not None:
+                self.valves.set_open(False, 0)
             for point in self.plan:
                 if self.cancelled.is_set():
                     raise InterruptedError("Stopped by operator")
@@ -695,25 +751,29 @@ class ExperimentRunner(threading.Thread):
                 self.service.submit("set", controlled)
                 started = time.monotonic()
                 self.events.put(("stage", (point, started)))
-                while not self.cancelled.wait(0.2):
-                    elapsed = time.monotonic() - started
-                    self.events.put(("progress", (point.number, min(elapsed, point.dwell_s), point.dwell_s)))
-                    if elapsed >= point.dwell_s:
-                        break
+                timing = self.cycle or CycleTiming(t1=point.dwell_s)
+                self._wait_delay(point, "t1", timing.t1)
+                if self.arduino is not None:
+                    self._record_spectrum(point, 1)
+                    self._wait_delay(point, "t2", timing.t2)
+                    if self.valves is not None:
+                        if self.cancelled.is_set():
+                            raise InterruptedError("Stopped by operator")
+                        self.valves.set_open(True, point.number)
+                    self._wait_delay(point, "t3", timing.t3)
+                    self._record_spectrum(point, 2)
+                    self._wait_delay(point, "t4", timing.t4)
+                    if self.valves is not None:
+                        self.valves.set_open(False, point.number)
                 if self.cancelled.is_set():
                     raise InterruptedError("Stopped by operator")
-                if self.arduino is not None:
-                    self.events.put(("nmr_trigger_wait", point))
-                    self.arduino.submit(
-                        "trigger",
-                        {"run_id": self.run_id, "point": point.number, "cancel_event": self.cancelled, "timeout_s": self.arduino_timeout_s},
-                        timeout_s=self.arduino_timeout_s + 10,
-                    )
-                    self.events.put(("spectrum_confirmed", point))
+                self.events.put(("point_completed", point))
             completed = True
         except Exception as exc:
             self.events.put(("runner_error", str(exc)))
         finally:
+            if self.valves is not None and self.valves.is_open:
+                self.valves.set_open(False, 0)
             try:
                 self.service.submit("zero", controlled)
                 if completed:
@@ -734,7 +794,8 @@ class ExperimentPlot(tk.Canvas):
         self.current_point: int | None = None
         self.bind("<Configure>", lambda _event: self.redraw())
 
-    def set_data(self, plan: list[ExperimentPoint] | None, h2_serial: str | None, alkene_serial: str | None, devices: dict[str, DeviceInfo], current_point: int | None) -> None:
+    def set_data(self, plan: list[ExperimentPoint] | None, h2_serial: str | None, alkene_serial: str | None, devices: dict[str, DeviceInfo], current_point: int | None, extra_delay_s: float = 0.0) -> None:
+        self.extra_delay_s = extra_delay_s
         self.plan = list(plan or [])
         self.h2_serial, self.alkene_serial = h2_serial, alkene_serial
         self.devices, self.current_point = dict(devices), current_point
@@ -761,7 +822,11 @@ class ExperimentPlot(tk.Canvas):
             self.create_line(left, y, left + chart_width, y, fill="#e5e7eb")
             self.create_text(left - 7, y, text=f"{value:g}", anchor="e", fill="#475569", font=("Segoe UI", 8))
         count = len(self.plan)
-        total_time = sum(point.dwell_s for point in self.plan)
+        durations = [point.dwell_s + getattr(self, "extra_delay_s", 0.0) for point in self.plan]
+        zero_delays = not any(durations)
+        if zero_delays:
+            durations = [1.0] * len(self.plan)
+        total_time = sum(durations)
         x_for = lambda elapsed: left + chart_width * (elapsed / max(total_time, 1.0))
         y_for = lambda value: top + chart_height - chart_height * value / maximum
         for index in range(5):
@@ -769,7 +834,8 @@ class ExperimentPlot(tk.Canvas):
             x = x_for(elapsed)
             self.create_line(x, top + chart_height, x, top + chart_height + 4, fill="#64748b")
             self.create_text(x, top + chart_height + 16, text=f"{elapsed:g}", fill="#475569", font=("Segoe UI", 8))
-        self.create_text(left + chart_width / 2, height - 10, text="Время, с", fill="#334155", font=("Segoe UI", 9))
+        axis_label = "Номер точки (все задержки равны нулю)" if zero_delays else "Сумма задержек t1–t4, с · время ЯМР не включено"
+        self.create_text(left + chart_width / 2, height - 10, text=axis_label, fill="#334155", font=("Segoe UI", 9))
         primary = self.devices.get(self.h2_serial or "")
         primary_label = "Поток MFC" if self.alkene_serial is None else "Поток H₂"
         if self.alkene_serial is None and primary is not None:
@@ -780,15 +846,15 @@ class ExperimentPlot(tk.Canvas):
         for series_index, (label, color, values) in enumerate(series):
             coordinates: list[float] = []
             elapsed = 0.0
-            for point, value in zip(self.plan, values):
-                coordinates.extend((x_for(elapsed), y_for(value), x_for(elapsed + point.dwell_s), y_for(value)))
-                elapsed += point.dwell_s
+            for duration, value in zip(durations, values):
+                coordinates.extend((x_for(elapsed), y_for(value), x_for(elapsed + duration), y_for(value)))
+                elapsed += duration
             self.create_line(*coordinates, fill=color, width=2)
             legend_x = left + series_index * 145
             self.create_line(legend_x, 38, legend_x + 20, 38, fill=color, width=2)
             self.create_text(legend_x + 25, 38, text=label, anchor="w", fill="#334155", font=("Segoe UI", 9))
         if self.current_point is not None and 1 <= self.current_point <= count:
-            elapsed = sum(point.dwell_s for point in self.plan[:self.current_point - 1])
+            elapsed = sum(durations[:self.current_point - 1])
             x = x_for(elapsed)
             self.create_line(x, top, x, top + chart_height, fill="#16a34a", dash=(3, 3))
             self.create_text(x + 4, top + 8, text=f"Точка {self.current_point}", anchor="w", fill="#166534", font=("Segoe UI", 9))
@@ -859,7 +925,7 @@ class GasLineApp(tk.Tk):
         self.arduino = ArduinoNMRService(self.arduino_settings, self.events)
         self.runner: ExperimentRunner | None = None
         self.control_enabled = tk.BooleanVar(value=False)
-        self.operation_mode = tk.StringVar(value="automatic")
+        self.operation_mode = tk.StringVar(value="automatic-arduino")
         self.operation_mode_hint = tk.StringVar()
         self.available_port_var = tk.StringVar(value="")
         self.arduino_port_var = tk.StringVar(value=str(self.arduino_settings["port"]))
@@ -878,7 +944,15 @@ class GasLineApp(tk.Tk):
         self.reference_pressure_var = tk.StringVar(value="")
         self.fluid_conditions_var = tk.StringVar(value="Выберите подключённый прибор в таблице.")
         self._conditions_snapshot: tuple[Any, ...] | None = None
-        self.plan_vars = {key: tk.StringVar(value=value) for key, value in {"start": "10", "stop": "150", "step": "10", "ratio": "4", "dwell": "60"}.items()}
+        saved_design = getattr(store, "experiment", {})
+        self.plan_vars = {key: tk.StringVar(value=str(saved_design.get(key, value))) for key, value in {"start": 10, "stop": 150, "step": 10, "ratio": 4}.items()}
+        self.cycle_vars = {key: tk.StringVar(value=str(saved_design.get(key, value))) for key, value in CYCLE_DEFAULTS.items()}
+        # The existing gas-plan model calls the initial stabilization time dwell.
+        self.plan_vars["dwell"] = self.cycle_vars["t1"]
+        self.design_summary_var = tk.StringVar()
+        self.design_status_var = tk.StringVar(value="Настройте потоки и задержки, затем сохраните дизайн.")
+        self.valve_status_var = tk.StringVar(value="Клапан: не используется в этом режиме.")
+        self.active_cycle_stage: str | None = None
         self.status_var = tk.StringVar(value="Выберите COM-порт и подключите расходомер.")
         self.port_warning_var = tk.StringVar(value="")
         self.plan_var = tk.StringVar(value="Задайте диапазон потока, шаг и время на каждой точке.")
@@ -893,6 +967,11 @@ class GasLineApp(tk.Tk):
         self.manual_commands_pending: set[str] = set()
         self._connection_log_lines: list[str] = []
         self._build()
+        for variable in {**self.plan_vars, **self.cycle_vars}.values():
+            if variable is not self.plan_vars["dwell"]:
+                variable.trace_add("write", self._design_changed)
+        self.cycle_vars["t1"].trace_add("write", self._design_changed)
+        self._update_design_summary()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.service.start()
         self.arduino.start()
@@ -901,6 +980,60 @@ class GasLineApp(tk.Tk):
 
     def _build(self) -> None:
         build_interface(self)
+
+    def _open_design_window(self) -> None:
+        self._update_operation_mode_controls()
+        self.design_window.deiconify()
+        self.design_window.lift()
+        self.cycle_diagram.redraw()
+
+    def _focus_cycle_delay(self, name: str) -> None:
+        entry = self.cycle_entries[name]
+        entry.focus_set()
+        entry.selection_range(0, "end")
+
+    def _current_cycle(self) -> CycleTiming:
+        try:
+            values = {key: float(var.get().replace(",", ".")) for key, var in self.cycle_vars.items()}
+        except ValueError as exc:
+            raise ValueError("Задержки t1–t4 должны быть числами (в секундах)") from exc
+        return CycleTiming(**values)
+
+    def _update_design_summary(self) -> None:
+        self.design_summary_var.set(
+            f"Поток: {self.plan_vars['start'].get()} → {self.plan_vars['stop'].get()}, шаг {self.plan_vars['step'].get()}\n"
+            + " · ".join(f"{key} = {var.get()} с" for key, var in self.cycle_vars.items())
+            + "\nДва спектра на точку; время записи добавляется к задержкам."
+        )
+
+    def _design_changed(self, *_args) -> None:
+        self._update_design_summary()
+        self.design_status_var.set("Дизайн изменён. Сохраните настройки для следующего запуска программы.")
+        if not (self.runner and self.runner.is_alive()):
+            self.active_plan = []
+            self.current_plan_point = None
+            for item in self.schedule_tree.get_children():
+                self.schedule_tree.delete(item)
+            self.run_progress.configure(value=0)
+            self.completed_points_var.set("План изменён; требуется проверка")
+            self.plan_var.set("План изменён. Нажмите «Проверить план».")
+            self._redraw_experiment_view()
+
+    def _save_experiment_design(self) -> None:
+        if self.runner and self.runner.is_alive():
+            return
+        try:
+            cycle = self._current_cycle()
+            # Saving the design does not require connected devices.
+            self._current_plan(single_mfc=len(self.devices) <= 1)
+            settings = {key: float(self.plan_vars[key].get().replace(",", ".")) for key in ("start", "stop", "step", "ratio")}
+            if not math.isfinite(settings["ratio"]) or settings["ratio"] <= 0:
+                raise ValueError("Соотношение H₂ : алкен должно быть больше нуля")
+            settings.update({key: getattr(cycle, key) for key in CYCLE_DEFAULTS})
+            self.store.save_experiment(settings)
+            self.design_status_var.set("Дизайн сохранён в конфигурации. Перед запуском план проверяется по подключённым MFC.")
+        except Exception as exc:
+            self.design_status_var.set("Не удалось сохранить дизайн: " + str(exc))
 
     def _update_available_ports(self) -> None:
         ports = sorted(
@@ -920,10 +1053,10 @@ class GasLineApp(tk.Tk):
             self.after(2000, self._refresh_available_ports)
 
     def _operation_mode_changed(self) -> None:
-        if self.operation_mode.get() == "manual" and self.runner and self.runner.is_alive():
-            self.operation_mode.set("automatic-arduino" if self.runner.arduino is not None else "automatic")
+        if self.runner and self.runner.is_alive():
+            self.operation_mode.set("automatic-arduino-valves" if self.runner.valves is not None else "automatic-arduino")
             messagebox.showwarning("Эксперимент выполняется", "Остановите эксперимент перед переходом к ручному управлению.")
-        elif self.operation_mode.get() in {"automatic", "automatic-arduino"} and (
+        elif self.operation_mode.get() in AUTOMATIC_MODES and (
             self.manual_commands_pending or any(flow > 0 for flow in self.manual_setpoints.values())
         ):
             self.operation_mode.set("manual")
@@ -934,8 +1067,9 @@ class GasLineApp(tk.Tk):
         self._update_operation_mode_controls()
 
     def _update_operation_mode_controls(self) -> None:
-        automatic = self.operation_mode.get() in {"automatic", "automatic-arduino"}
-        arduino_mode = self.operation_mode.get() == "automatic-arduino"
+        automatic = self.operation_mode.get() in AUTOMATIC_MODES
+        arduino_mode = automatic
+        valves_mode = self.operation_mode.get() == "automatic-arduino-valves"
         running = bool(self.runner and self.runner.is_alive())
         if running:
             topology = "single" if self.plan_alkene_serial is None else "pair"
@@ -949,13 +1083,12 @@ class GasLineApp(tk.Tk):
         # Re-layout only when the mode or actual MFC topology changes: polling
         # Arduino must never make the plan table visibly jump.
         single_mfc = topology in {"none", "single"}
-        layout = (automatic, arduino_mode, topology)
+        layout = (automatic, valves_mode, topology)
         if getattr(self, "_mode_layout", None) != layout:
-            for frame in (self.arduino_frame, self.plan_frame, self.plan_view_frame, self.manual_frame):
+            for frame in (self.arduino_frame, self.plan_view_frame, self.manual_frame):
                 frame.pack_forget()
             if automatic:
                 self.experiment_columns.pack(fill="both", expand=True, before=self.recent_events_frame)
-                self.plan_frame.pack(fill="x", pady=(0, 8))
                 if arduino_mode:
                     self.arduino_frame.pack(fill="x", pady=(0, 8))
                 self.plan_view_frame.pack(fill="x", pady=(0, 8))
@@ -965,6 +1098,9 @@ class GasLineApp(tk.Tk):
                 self.manual_frame.pack(fill="x", pady=(0, 8), before=self.recent_events_frame)
                 self.auto_controls.pack_forget()
             self._mode_layout = layout
+            self.cycle_diagram.valves_enabled = valves_mode
+            self.cycle_diagram.redraw()
+            self.valve_status_var.set("Клапан: имитация, исходное состояние — закрыт." if valves_mode else "Клапан: не используется в этом режиме.")
         for widget in (self.plan_field_labels["ratio"], self.plan_field_entries["ratio"]):
             widget.grid_remove() if single_mfc else widget.grid()
         plan_title = {
@@ -974,9 +1110,10 @@ class GasLineApp(tk.Tk):
         }[topology]
         self.plan_frame.configure(text=plan_title)
         for widget in self.plan_input_widgets:
-            enabled = automatic and bool(self.devices) and not running and not (single_mfc and widget is self.plan_field_entries["ratio"])
+            enabled = not running and not (single_mfc and widget is self.plan_field_entries["ratio"])
             widget.configure(state="normal" if enabled else "disabled")
-        self.validate_plan_button.configure(state="normal" if automatic and bool(self.devices) and not running else "disabled")
+        self.validate_plan_button.configure(state="normal" if bool(self.devices) and not running else "disabled")
+        self.save_design_button.configure(state="disabled" if running else "normal")
         self.start_experiment_button.configure(state="normal" if automatic and self.devices and not running else "disabled")
         self.stop_experiment_button.configure(state="normal" if automatic and running else "disabled")
         for button in self.mode_buttons:
@@ -990,8 +1127,9 @@ class GasLineApp(tk.Tk):
             base = "Весь поток подаётся одним MFC." if single_mfc else "Общий поток делится между H₂ и алкеном в заданном соотношении."
             if topology == "none":
                 base = "Arduino подключается отдельно: сначала подключите хотя бы один MFC на вкладке «Подключение»."
-            detail = ("После выдержки запускается ЯМР. Следующая точка — после ответного TTL."
-                      if arduino_mode else "На каждой точке поток удерживается в течение заданной выдержки.")
+            detail = "Два спектра на точку с подтверждением TTL; задержки t1–t4 задаются в окне дизайна."
+            if valves_mode:
+                detail += " Клапан пока имитируется: открытие между спектрами, закрытие после t4."
             self.operation_mode_hint.set(base + " " + detail)
         elif self.devices:
             self.operation_mode_hint.set("Введите поток у нужного прибора и нажмите «Установить». «Ноль» прекращает подачу через этот MFC.")
@@ -1428,12 +1566,18 @@ class GasLineApp(tk.Tk):
     def _redraw_experiment_view(self) -> None:
         if self.flow_plot is None or not self.flow_plot.winfo_exists():
             return
+        try:
+            timing = self._current_cycle()
+            extra_delay_s = timing.t2 + timing.t3 + timing.t4
+        except ValueError:
+            extra_delay_s = 0.0
         self.flow_plot.set_data(
             self.active_plan,
             self.plan_h2_serial,
             self.plan_alkene_serial,
             self.devices,
             self.current_plan_point,
+            extra_delay_s,
         )
 
     def _open_graph_window(self) -> None:
@@ -1549,10 +1693,8 @@ class GasLineApp(tk.Tk):
         return build_plan(values["start"], values["stop"], values["step"], values["ratio"], values["dwell"])
 
     def _validate_plan(self) -> list[ExperimentPoint] | None:
-        if self.operation_mode.get() not in {"automatic", "automatic-arduino"}:
-            self.plan_var.set("Select Автоматический режим to validate a scheduled plan.")
-            return None
         try:
+            cycle = self._current_cycle()
             h2, alkene = self._experiment_devices()
             plan = self._current_plan(alkene is None)
             last = plan[-1]
@@ -1560,10 +1702,9 @@ class GasLineApp(tk.Tk):
                 raise ValueError(f"Конечный поток превышает диапазон: {last.total_flow:.6g}/{h2.capacity:.6g} {h2.unit}")
             if alkene is not None and (last.h2_flow > h2.capacity + 1e-7 or last.alkene_flow > alkene.capacity + 1e-7):
                 raise ValueError(f"Конечный поток превышает диапазон: H2 {last.h2_flow:.6g}/{h2.capacity:.6g}, alkene {last.alkene_flow:.6g}/{alkene.capacity:.6g} {h2.unit}")
-            seconds = sum(point.dwell_s for point in plan)
+            seconds = len(plan) * cycle.delay_s
             self._show_plan(plan, h2, alkene)
-            extra = " + время ЯМР" if self.operation_mode.get() == "automatic-arduino" else ""
-            self.plan_var.set(f"{len(plan)} точек · {seconds:g} с выдержки{extra}\nДиапазон потока проверен.")
+            self.plan_var.set(f"{len(plan)} точек · {len(plan) * 2} спектров · {seconds:g} с задержек + время ЯМР\nДиапазон потока проверен.")
             return plan
         except Exception as exc:
             self.plan_var.set("Ошибка плана: " + str(exc))
@@ -1574,8 +1715,8 @@ class GasLineApp(tk.Tk):
             self.control_enabled.set(False)
 
     def _start_experiment(self) -> None:
-        if self.operation_mode.get() not in {"automatic", "automatic-arduino"}:
-            messagebox.showinfo("Ручной режим", "Switch to Автоматический режим before starting the scheduled experiment.")
+        if self.operation_mode.get() not in AUTOMATIC_MODES:
+            messagebox.showinfo("Ручной режим", "Выберите «Авто + ЯМР» или «Авто + ЯМР + клапаны».")
             return
         if not self.control_enabled.get():
             messagebox.showwarning("Запись отключена", "Включите «Разрешить подачу газа» рядом с кнопкой запуска.")
@@ -1587,7 +1728,9 @@ class GasLineApp(tk.Tk):
         if plan is None:
             return
         h2, alkene = self._experiment_devices()
-        arduino_mode = self.operation_mode.get() == "automatic-arduino"
+        arduino_mode = self.operation_mode.get() in AUTOMATIC_MODES
+        valves_mode = self.operation_mode.get() == "automatic-arduino-valves"
+        cycle = self._current_cycle()
         timeout_s = 180.0
         if arduino_mode:
             if not self.arduino.ready:
@@ -1605,7 +1748,10 @@ class GasLineApp(tk.Tk):
                 messagebox.showwarning("Настройки Arduino changed", "После изменения порта или скорости подключите Arduino заново.")
                 return
             timeout_s = arduino_settings["spectrum_timeout_s"]
-        extra = "\nКаждая точка будет ожидать ответный TTL от ЯМР." if arduino_mode else ""
+        extra = "\nВ каждой точке записываются два спектра, каждый с ответным TTL от ЯМР."
+        extra += f"\nt1={cycle.t1:g}, t2={cycle.t2:g}, t3={cycle.t3:g}, t4={cycle.t4:g} с."
+        if valves_mode:
+            extra += "\nКлапан ИМИТИРУЕТСЯ: физических команд открытия и закрытия не будет."
         if alkene is None:
             prompt = (
                 f"Запустить {len(plan)} точек на MFC {h2.serial_number}?\n"
@@ -1622,13 +1768,15 @@ class GasLineApp(tk.Tk):
             self.service, plan, h2.serial_number, None if alkene is None else alkene.serial_number, self.events,
             arduino=self.arduino if arduino_mode else None,
             arduino_timeout_s=timeout_s,
+            cycle=cycle,
+            valves=ValvePlaceholder(self.events) if valves_mode else None,
         )
         self.runner.start()
         self.progress_var.set("Запуск эксперимента…")
         self._update_operation_mode_controls()
 
     def _stop_experiment(self) -> None:
-        if self.operation_mode.get() not in {"automatic", "automatic-arduino"}:
+        if self.operation_mode.get() not in AUTOMATIC_MODES:
             messagebox.showinfo("Ручной режим", "Нажмите «Ноль» в карточке нужного MFC.")
             return
         if not self.runner or not self.runner.is_alive():
@@ -1647,8 +1795,6 @@ class GasLineApp(tk.Tk):
                     self._update_devices(payload)
                 elif kind == "stage":
                     point, _ = payload
-                    if self.current_plan_point is not None:
-                        self._point_status(self.current_plan_point, "Завершена")
                     self._point_status(point.number, "Выдержка")
                     if self.plan_alkene_serial is None:
                         self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {point.number}: MFC={point.total_flow:g}, dwell={point.dwell_s:g} s")
@@ -1665,20 +1811,43 @@ class GasLineApp(tk.Tk):
                 elif kind == "progress":
                     number, elapsed, dwell = payload
                     self.progress_var.set(f"Точка {number}: выдержка {elapsed:.0f} / {dwell:.0f} с")
+                elif kind == "cycle_stage":
+                    number, name, seconds = payload
+                    self.active_cycle_stage = name
+                    self.cycle_diagram.active_stage = name
+                    self.cycle_diagram.redraw()
+                    self._point_status(number, f"Задержка {name}")
+                    self.progress_var.set(f"Точка {number}: {name}, {seconds:g} с")
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {number}: {name} = {seconds:g} s")
+                elif kind == "cycle_progress":
+                    number, name, elapsed, seconds = payload
+                    self.progress_var.set(f"Точка {number}: {name}, {elapsed:.1f} / {seconds:g} с")
                 elif kind == "nmr_trigger_wait":
-                    self._point_status(payload.number, "Ожидание ЯМР")
-                    self.progress_var.set(f"Точка {payload.number}: выдержка завершена. Ожидание запуска и ответа ЯМР.")
-                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {payload.number}: requesting Arduino/NMR TTL handshake.")
+                    point, spectrum = payload
+                    self.cycle_diagram.active_stage = f"nmr{spectrum}"
+                    self.cycle_diagram.redraw()
+                    self._point_status(point.number, f"ЯМР {spectrum}/2: ожидание TTL")
+                    self.progress_var.set(f"Точка {point.number}: спектр {spectrum}/2. Ожидание запуска и ответа ЯМР.")
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {point.number}: spectrum {spectrum}/2, requesting Arduino/NMR TTL handshake.")
                 elif kind == "spectrum_confirmed":
+                    point, spectrum = payload
+                    self._point_status(point.number, f"Спектр {spectrum}/2 принят")
+                    self.progress_var.set(f"Точка {point.number}: спектр {spectrum}/2 подтверждён ответным TTL.")
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {point.number}: spectrum {spectrum}/2 confirmed by returning NMR TTL.")
+                elif kind == "valve_placeholder":
+                    number, is_open = payload
+                    state = "открыт" if is_open else "закрыт"
+                    self.valve_status_var.set(f"Клапан: {state} (ИМИТАЦИЯ, команда не отправлялась).")
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  VALVE STUB · точка {number}: {state}; физическое управление не реализовано.")
+                elif kind == "point_completed":
                     self._point_status(payload.number, "Завершена")
-                    self.progress_var.set(f"Точка {payload.number}: получен ответ ЯМР. Переход к следующей точке.")
-                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {payload.number}: Arduino confirmed returning NMR TTL; spectrum accepted.")
+                    self.progress_var.set(f"Точка {payload.number}: цикл завершён. Переход к следующей точке.")
                 elif kind == "finished":
-                    if self.current_plan_point is not None:
-                        self._point_status(self.current_plan_point, "Завершена")
                     self._append_connection_log(f"{time.strftime('%H:%M:%S')}  {payload}")
                     self.progress_var.set(payload)
                     self.current_plan_point = None
+                    self.cycle_diagram.active_stage = None
+                    self.cycle_diagram.redraw()
                     self._redraw_experiment_view()
                 elif kind == "runner_error":
                     if self.current_plan_point is not None:
@@ -1686,6 +1855,8 @@ class GasLineApp(tk.Tk):
                     self._append_connection_log(f"{time.strftime('%H:%M:%S')}  Ошибка эксперимента: {payload}")
                     self.progress_var.set("Ошибка эксперимента: " + payload)
                     self.control_enabled.set(False)
+                    self.cycle_diagram.active_stage = None
+                    self.cycle_diagram.redraw()
                 elif kind == "port_warning":
                     self.port_warning_var.set(payload)
                 elif kind == "port_recovered":

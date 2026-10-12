@@ -2,6 +2,7 @@
 
 import tkinter as tk
 from tkinter import font as tkfont, ttk
+from experiment_cycle import OPERATION_LABELS
 
 
 ROLE_LABELS = {"Unassigned": "Не назначена", "H2": "Водород (H₂)", "Alkene": "Алкен", "Other": "Другой газ"}
@@ -139,6 +140,90 @@ def table(parent, columns, height=5):
     return tree
 
 
+class CycleDiagram(tk.Canvas):
+    """A schematic, not a time-scaled plot: acquisition duration is unknown."""
+
+    def __init__(self, master, variables, select_delay):
+        super().__init__(master, height=280, background="white", highlightthickness=0)
+        self.variables, self.select_delay = variables, select_delay
+        self.valves_enabled = False
+        self.active_stage = None
+        self.bind("<Configure>", lambda _event: self.redraw())
+        for variable in variables.values():
+            variable.trace_add("write", lambda *_args: self.redraw())
+
+    def redraw(self):
+        self.delete("all")
+        self.configure(scrollregion=(0, 0, 940, 280))
+        blue, green, grey = "#206d83", "#49795b", "#687887"
+        self.create_text(22, 18, anchor="w", text="Одна точка · два спектра · длительность записи определяется ответным TTL", fill=grey)
+        self.create_text(40, 60, text="Новый\nрасход", fill=blue)
+        self.create_line(40, 82, 40, 104, fill=blue, arrow="last")
+        coords = [40, 100, 210, 100, 210, 74, 220, 74, 220, 100,
+                  300, 100, 300, 74, 310, 74, 310, 100,
+                  620, 100, 620, 74, 630, 74, 630, 100,
+                  710, 100, 710, 74, 720, 74, 720, 100, 900, 100]
+        self.create_line(*coords, fill=blue, width=2)
+        for x, text in ((210, "TTL → ЯМР"), (300, "TTL ← ЯМР"), (620, "TTL → ЯМР"), (710, "TTL ← ЯМР")):
+            self.create_text(x, 57, text=text, fill=blue, font=("Segoe UI", 8))
+        for key, x1, x2 in (("t1", 45, 200), ("t2", 315, 445), ("t3", 455, 610), ("t4", 725, 875)):
+            active = self.active_stage == key
+            tag = f"delay-{key}"
+            self.create_line(x1, 32, x2, 32, arrow="both", fill=blue, tags=tag)
+            self.create_text((x1 + x2) / 2, 46, text=f"{key} = {self.variables[key].get()} с",
+                             fill="#b45309" if active else blue, font=("Segoe UI", 10, "bold"), tags=tag)
+            self.tag_bind(tag, "<Button-1>", lambda _event, name=key: self.select_delay(name))
+            self.tag_bind(tag, "<Enter>", lambda _event: self.configure(cursor="hand2"))
+            self.tag_bind(tag, "<Leave>", lambda _event: self.configure(cursor=""))
+        for spectrum, x1, x2 in ((1, 210, 310), (2, 620, 720)):
+            active = self.active_stage == f"nmr{spectrum}"
+            self.create_rectangle(x1, 120, x2, 158, fill="#fff1d6" if active else "#e8f1f5", outline=blue)
+            self.create_text((x1 + x2) / 2, 139, text=f"Спектр №{spectrum}", fill=blue)
+        self.create_text(22, 184, anchor="w", text="Клапан (имитация)" if self.valves_enabled else "Клапан: не используется в этом режиме", fill=green if self.valves_enabled else grey)
+        if self.valves_enabled:
+            self.create_line(40, 240, 450, 240, 450, 208, 880, 208, 880, 240, 900, 240, fill=green, width=2)
+            self.create_text(450, 253, text="Открыть", fill=green)
+            self.create_text(880, 253, text="Закрыть", fill=green)
+            self.create_text(250, 224, text="Закрыт", fill=grey)
+            self.create_text(665, 224, text="Открыт", fill=green)
+        else:
+            self.create_line(40, 240, 900, 240, fill=grey, dash=(5, 4))
+        self.create_text(900, 120, anchor="e", text="После t4 →\nследующая точка", fill=grey)
+
+
+def build_cycle_editor(app):
+    cycle = section(app.design_content, "Цикл одной экспериментальной точки")
+    note(cycle, "Расход удерживается на протяжении всего цикла. Нажмите t1–t4 на схеме, чтобы перейти к соответствующему полю. Схема не в масштабе времени.").pack(fill="x", pady=(0, 6))
+    diagram_frame = ttk.Frame(cycle)
+    diagram_frame.pack(fill="x")
+    app.cycle_diagram = CycleDiagram(diagram_frame, app.cycle_vars, app._focus_cycle_delay)
+    app.cycle_diagram.pack(fill="x")
+    scrollbar = ttk.Scrollbar(diagram_frame, orient="horizontal", command=app.cycle_diagram.xview)
+    scrollbar.pack(fill="x")
+    app.cycle_diagram.configure(xscrollcommand=scrollbar.set)
+    fields = ttk.Frame(cycle)
+    fields.pack(fill="x", pady=(8, 0))
+    app.cycle_entries = {}
+    descriptions = {"t1": "После изменения расхода", "t2": "После спектра №1", "t3": "До запуска спектра №2", "t4": "После спектра №2"}
+    for i, (key, variable) in enumerate(app.cycle_vars.items()):
+        cell = ttk.Frame(fields, padding=(0, 0, 12, 6))
+        cell.grid(row=i // 2, column=i % 2, sticky="ew")
+        fields.columnconfigure(i % 2, weight=1, uniform="cycle")
+        ttk.Label(cell, text=f"{key}, с · {descriptions[key]}").pack(anchor="w")
+        entry = ttk.Entry(cell, textvariable=variable, width=14)
+        entry.pack(fill="x", pady=(4, 0))
+        app.cycle_entries[key] = entry
+        app.plan_input_widgets.append(entry)
+    note(cycle, "t2: до открытия клапана; t3: после открытия; t4: до закрытия. Без клапанов действия открытия/закрытия пропускаются, задержки сохраняются.").pack(fill="x")
+    note(cycle, "Клапаны пока только имитируются в интерфейсе и журнале. Команды на Arduino, пины и электрическая схема управления ещё не реализованы.").pack(fill="x", pady=(6, 0))
+    actions = ttk.Frame(app.design_content)
+    actions.pack(fill="x", pady=(4, 8))
+    app.save_design_button = ttk.Button(actions, text="Сохранить дизайн", command=app._save_experiment_design)
+    app.save_design_button.pack(side="left")
+    ttk.Button(actions, text="Закрыть", command=app.design_window.withdraw).pack(side="right")
+    note(app.design_content, variable=app.design_status_var).pack(fill="x")
+
+
 def build_interface(app):
     """Build the four tabs and a fixed experiment control bar."""
     body = ttk.Frame(app, padding=8)
@@ -234,10 +319,12 @@ def build_interface(app):
     app.mode_buttons = []
     row = ttk.Frame(mode)
     row.pack(fill="x")
-    for value, label in (("automatic", "По точкам"), ("automatic-arduino", "По точкам + ЯМР"), ("manual", "Ручное управление")):
+    for value, label in OPERATION_LABELS.items():
         button = ttk.Radiobutton(row, text=label, variable=app.operation_mode, value=value, command=app._operation_mode_changed)
         button.pack(side="left", padx=(0, 22))
         app.mode_buttons.append(button)
+    ttk.Button(mode, text="Дизайн эксперимента ↗", command=app._open_design_window).pack(anchor="w", pady=(8, 0))
+    note(mode, variable=app.operation_mode_hint).pack(fill="x", pady=(6, 0))
     app.experiment_columns = ttk.Frame(experiment)
     app.experiment_columns.pack(fill="both", expand=True)
     app.experiment_columns.columnconfigure(0, weight=2, minsize=300)
@@ -265,9 +352,23 @@ def build_interface(app):
     ttk.Button(arduino_actions, text="Отключить", command=app._disconnect_arduino).pack(side="left", padx=8)
     note(app.arduino_frame, variable=app.arduino_status_var).pack(fill="x", pady=(4, 0))
     note(app.arduino_frame, "Выход D8 · TTL 5 мс\nВход D2 · завершение записи").pack(fill="x", pady=(6, 0))
-    app.plan_frame = section(left, "План подачи газа")
+    app.design_summary_frame = section(left, "Дизайн эксперимента")
+    ttk.Button(app.design_summary_frame, text="Открыть дизайн эксперимента ↗", command=app._open_design_window).pack(anchor="w")
+    note(app.design_summary_frame, variable=app.design_summary_var).pack(fill="x", pady=(6, 0))
+    app.valve_status_label = note(app.design_summary_frame, variable=app.valve_status_var)
+    app.valve_status_label.pack(fill="x", pady=(4, 0))
+    app.design_window = tk.Toplevel(app)
+    app.design_window.withdraw()
+    app.design_window.title("Дизайн эксперимента · цикл и потоки")
+    app.design_window.geometry(f"{min(1060, app.winfo_screenwidth() - 60)}x{min(780, app.winfo_screenheight() - 100)}")
+    app.design_window.minsize(680, 500)
+    app.design_window.protocol("WM_DELETE_WINDOW", app.design_window.withdraw)
+    design_scroll = ScrollPanel(app.design_window)
+    design_scroll.pack(fill="both", expand=True, padx=10, pady=10)
+    app.design_content = design_scroll.content
+    app.plan_frame = section(app.design_content, "План подачи газа")
     app.plan_field_labels, app.plan_field_entries, app.plan_input_widgets = {}, {}, []
-    for i, (label, key) in enumerate((("Начальный поток", "start"), ("Конечный поток", "stop"), ("Шаг потока", "step"), ("H₂ : алкен", "ratio"), ("Выдержка, с", "dwell"))):
+    for i, (label, key) in enumerate((("Начальный поток", "start"), ("Конечный поток", "stop"), ("Шаг потока", "step"), ("H₂ : алкен", "ratio"))):
         label_widget = ttk.Label(app.plan_frame, text=label, style="Muted.TLabel")
         label_widget.grid(row=i, column=0, sticky="w", padx=(0, 12), pady=1)
         entry = ttk.Entry(app.plan_frame, textvariable=app.plan_vars[key], width=10)
@@ -280,6 +381,7 @@ def build_interface(app):
     app.validate_plan_button = ttk.Button(app.plan_frame, text="Проверить план", command=app._validate_plan)
     app.validate_plan_button.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
     note(app.plan_frame, variable=app.plan_var).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+    build_cycle_editor(app)
     readings = section(right, "Текущие показания")
     app.live_tree = table(readings, [("device", "Прибор / порт", 155), ("gas", "Газ", 65), ("set", "Уставка", 110), ("flow", "Измерено", 110)], height=2)
     app.live_timestamp_var = tk.StringVar(app, value="Нет данных от приборов")
@@ -292,7 +394,7 @@ def build_interface(app):
     note(app.run_status_frame, variable=app.completed_points_var).pack(fill="x")
     app.plan_view_frame = section(right, "Точки эксперимента")
     ttk.Button(app.plan_view_frame, text="Открыть график ↗", command=app._open_graph_window).pack(anchor="e", pady=(0, 4))
-    app.schedule_tree = table(app.plan_view_frame, [("point", "№", 45), ("total", "Поток", 80), ("h2", "H₂", 80), ("alkene", "Алкен", 80), ("dwell", "Выдержка, с", 95), ("status", "Состояние", 145)], height=4)
+    app.schedule_tree = table(app.plan_view_frame, [("point", "№", 45), ("total", "Поток", 80), ("h2", "H₂", 80), ("alkene", "Алкен", 80), ("dwell", "t1, с", 80), ("status", "Состояние", 145)], height=4)
     app.manual_frame = ttk.LabelFrame(experiment, text="Потоки подключённых приборов", padding=8)
     app.manual_cards_frame = ttk.Frame(app.manual_frame)
     app.manual_cards_frame.pack(fill="both", expand=True)

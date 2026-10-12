@@ -20,6 +20,16 @@
     "spectrum_timeout_s": 180,
     "startup_timeout_s": 8
   },
+  "experiment": {
+    "start": 10,
+    "stop": 150,
+    "step": 10,
+    "ratio": 4,
+    "t1": 60,
+    "t2": 0,
+    "t3": 0,
+    "t4": 0
+  },
   "roles": {},
   "device_modes": {},
   "fluid_profiles": {
