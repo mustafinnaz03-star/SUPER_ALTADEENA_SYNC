@@ -41,7 +41,7 @@ import serial
 from serial.tools import list_ports
 
 from bronkhorst_ui import ROLE_LABELS, MODE_LABELS, build_interface, configure_style
-from experiment_cycle import AUTOMATIC_MODES, CYCLE_DEFAULTS, OPERATION_LABELS, CycleTiming, ValvePlaceholder
+from experiment_cycle import AUTOMATIC_MODES, CYCLE_DEFAULTS, OPERATION_LABELS, CycleTiming, ArduinoValveController
 
 
 # FlowDDE parameter numbers, used by the EL-FLOW RS232/FLOW-BUS (ProPar) interface.
@@ -549,6 +549,8 @@ class ArduinoNMRService(threading.Thread):
         self.stopping = threading.Event()
         self.port: serial.Serial | None = None
         self.ready = False
+        self.relay_capable = False
+        self.last_keepalive = 0.0
 
     def _log(self, message: str) -> None:
         self.events.put(("arduino_log", f"{time.strftime('%H:%M:%S')}  ARDUINO: {message}"))
@@ -558,6 +560,7 @@ class ArduinoNMRService(threading.Thread):
 
     def _close_port(self) -> None:
         self.ready = False
+        self.relay_capable = False
         if self.port is not None:
             try:
                 self.port.close()
@@ -597,12 +600,56 @@ class ArduinoNMRService(threading.Thread):
             if line is None:
                 continue
             self._log(f"< {line}")
+            if line == "CAPABILITIES NMR RELAYS_D4_D5":
+                self.relay_capable = True
             if line == ARDUINO_READY:
                 self.ready = True
                 self._status(f"Arduino готова · {port}")
                 return
         self._close_port()
         raise TimeoutError(f"Arduino did not send '{ARDUINO_READY}' within {startup_timeout:g} s")
+
+    def _keepalive(self) -> None:
+        if self.ready and self.relay_capable and time.monotonic() - self.last_keepalive >= 1:
+            # Do not flood the GUI log with routine watchdog traffic.
+            if self.port is None or not self.port.is_open:
+                raise ConnectionError("Arduino COM port is not open")
+            self.port.write(b"KEEPALIVE\n")
+            self.last_keepalive = time.monotonic()
+
+    def _check_board_fault(self, line: str) -> None:
+        if line == "READY" or line.startswith(("BOOT", "FAILSAFE")):
+            self.ready = False
+            self.events.put(("valve_status", (0, None)))
+            raise ConnectionError("Arduino перезапустилась или потеряла связь. Подключите её заново; реле переведены прошивкой в OFF.")
+
+    def _set_valves(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.ready or not self.relay_capable:
+            raise ConnectionError("Нужна готовая Arduino с новой прошивкой TTL + реле D4/D5")
+        switched = bool(payload["switched"])
+        token = uuid4().hex[:16]
+        state = "ON" if switched else "OFF"
+        self._write_line(f"VALVES {token} {state}")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            self._keepalive()
+            line = self._read_line()
+            if not line:
+                continue
+            self._log(f"< {line}")
+            self._check_board_fault(line)
+            fields = line.split()
+            if len(fields) >= 3 and fields[1] == token:
+                if fields[0] == "ERROR":
+                    raise RuntimeError(f"Arduino: {line}")
+                if fields[0] == "VALVES_ACK":
+                    if fields[2:] != [state]:
+                        raise RuntimeError("Arduino подтвердила другое состояние реле")
+                    self._log(f"Реле D4/D5: {state} подтверждено Arduino.")
+                    return {"switched": switched}
+        # Never enqueue a second command behind an unacknowledged ON command.
+        # Worker-side timeout is shorter than the submit() timeout.
+        raise TimeoutError("Нет подтверждения переключения реле D4/D5")
 
     def _trigger_and_wait(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not self.ready:
@@ -617,6 +664,7 @@ class ArduinoNMRService(threading.Thread):
         acknowledged = False
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
+            self._keepalive()
             if cancel_event is not None and cancel_event.is_set():
                 try:
                     self._write_line(f"ABORT {token}")
@@ -627,6 +675,7 @@ class ArduinoNMRService(threading.Thread):
             if line is None:
                 continue
             self._log(f"< {line}")
+            self._check_board_fault(line)
             fields = line.split()
             if len(fields) < 3:
                 continue
@@ -646,6 +695,10 @@ class ArduinoNMRService(threading.Thread):
                 return {"run_id": run_id, "point": point}
             elif kind == "ERROR":
                 raise RuntimeError(f"Arduino reported ERROR for point {point}")
+        try:
+            self._write_line(f"ABORT {token}")
+        except Exception:
+            pass
         raise TimeoutError(f"Point {point}: no matching NMR_DONE TTL within {timeout_s:g} s")
 
     def _handle(self, command: ArduinoCommand) -> None:
@@ -654,7 +707,11 @@ class ArduinoNMRService(threading.Thread):
                 self._connect(command.payload or {})
             elif command.name == "trigger":
                 command.result = self._trigger_and_wait(command.payload or {})
+            elif command.name == "valves":
+                command.result = self._set_valves(command.payload or {})
             elif command.name == "disconnect":
+                if self.ready and self.relay_capable:
+                    self._set_valves({"switched": False})
                 self._close_port()
                 self._status("Arduino отключена.")
             elif command.name == "stop":
@@ -664,6 +721,15 @@ class ArduinoNMRService(threading.Thread):
         except Exception as exc:
             command.error = exc
             self._status(f"Ошибка Arduino: {exc}")
+            if command.name == "valves":
+                # Stop renewing the host lease after an unconfirmed relay
+                # command. Try OFF once; a broken link times out on the board.
+                try:
+                    self._write_line(f"VALVES {uuid4().hex[:16]} OFF")
+                except Exception:
+                    pass
+                self.ready = False
+                self.events.put(("valve_status", (0, None)))
         finally:
             if command.done:
                 command.done.set()
@@ -684,8 +750,23 @@ class ArduinoNMRService(threading.Thread):
                 try:
                     self._handle(self.commands.get(timeout=0.05))
                 except queue.Empty:
-                    pass
+                    if self.ready and self.port is not None:
+                        try:
+                            self._keepalive()
+                            line = self._read_line()
+                            if line:
+                                self._log(f"< {line}")
+                                self._check_board_fault(line)
+                        except Exception as exc:
+                            self.ready = False
+                            self.events.put(("valve_status", (0, None)))
+                            self._status(f"Ошибка связи Arduino: {exc}")
         finally:
+            if self.ready and self.relay_capable:
+                try:
+                    self._set_valves({"switched": False})
+                except Exception as exc:
+                    self._log(f"Не удалось подтвердить OFF при отключении: {exc}")
             self._close_port()
 
     def shutdown(self) -> None:
@@ -693,7 +774,7 @@ class ArduinoNMRService(threading.Thread):
 
 
 class ExperimentRunner(threading.Thread):
-    def __init__(self, service: SerialService, plan: list[ExperimentPoint], h2_serial: str, alkene_serial: str | None, events: queue.Queue[tuple[str, Any]], arduino: ArduinoNMRService | None = None, arduino_timeout_s: float = 180.0, cycle: CycleTiming | None = None, valves: ValvePlaceholder | None = None):
+    def __init__(self, service: SerialService, plan: list[ExperimentPoint], h2_serial: str, alkene_serial: str | None, events: queue.Queue[tuple[str, Any]], arduino: ArduinoNMRService | None = None, arduino_timeout_s: float = 180.0, cycle: CycleTiming | None = None, valves: ArduinoValveController | None = None):
         super().__init__(daemon=True)
         self.service, self.plan, self.h2_serial, self.alkene_serial, self.events = service, plan, h2_serial, alkene_serial, events
         self.arduino, self.arduino_timeout_s = arduino, arduino_timeout_s
@@ -710,6 +791,8 @@ class ExperimentRunner(threading.Thread):
         while True:
             if self.cancelled.is_set():
                 raise InterruptedError("Stopped by operator")
+            if self.arduino is not None and not getattr(self.arduino, "ready", True):
+                raise ConnectionError("Arduino отключилась во время выдержки")
             elapsed = min(time.monotonic() - started, seconds)
             self.events.put(("cycle_progress", (point.number, name, elapsed, seconds)))
             if elapsed >= seconds:
@@ -741,7 +824,7 @@ class ExperimentRunner(threading.Thread):
             if self.valves is not None and self.arduino is None:
                 raise ValueError("Valve mode requires the NMR/Arduino handshake")
             if self.valves is not None:
-                self.valves.set_open(False, 0)
+                self.valves.set_switched(False, 0)
             for point in self.plan:
                 if self.cancelled.is_set():
                     raise InterruptedError("Stopped by operator")
@@ -759,12 +842,12 @@ class ExperimentRunner(threading.Thread):
                     if self.valves is not None:
                         if self.cancelled.is_set():
                             raise InterruptedError("Stopped by operator")
-                        self.valves.set_open(True, point.number)
+                        self.valves.set_switched(True, point.number)
                     self._wait_delay(point, "t3", timing.t3)
                     self._record_spectrum(point, 2)
                     self._wait_delay(point, "t4", timing.t4)
                     if self.valves is not None:
-                        self.valves.set_open(False, point.number)
+                        self.valves.set_switched(False, point.number)
                 if self.cancelled.is_set():
                     raise InterruptedError("Stopped by operator")
                 self.events.put(("point_completed", point))
@@ -772,8 +855,11 @@ class ExperimentRunner(threading.Thread):
         except Exception as exc:
             self.events.put(("runner_error", str(exc)))
         finally:
-            if self.valves is not None and self.valves.is_open:
-                self.valves.set_open(False, 0)
+            if self.valves is not None and self.valves.is_switched is not False:
+                try:
+                    self.valves.set_switched(False, 0)
+                except Exception as exc:
+                    self.events.put(("runner_error", f"Не удалось подтвердить OFF реле: {exc}"))
             try:
                 self.service.submit("zero", controlled)
                 if completed:
@@ -1100,7 +1186,7 @@ class GasLineApp(tk.Tk):
             self._mode_layout = layout
             self.cycle_diagram.valves_enabled = valves_mode
             self.cycle_diagram.redraw()
-            self.valve_status_var.set("Клапан: имитация, исходное состояние — закрыт." if valves_mode else "Клапан: не используется в этом режиме.")
+            self.valve_status_var.set("Реле D4/D5: состояние ещё не подтверждено." if valves_mode else "Реле: не используются в этом режиме.")
         for widget in (self.plan_field_labels["ratio"], self.plan_field_entries["ratio"]):
             widget.grid_remove() if single_mfc else widget.grid()
         plan_title = {
@@ -1129,7 +1215,7 @@ class GasLineApp(tk.Tk):
                 base = "Arduino подключается отдельно: сначала подключите хотя бы один MFC на вкладке «Подключение»."
             detail = "Два спектра на точку с подтверждением TTL; задержки t1–t4 задаются в окне дизайна."
             if valves_mode:
-                detail += " Клапан пока имитируется: открытие между спектрами, закрытие после t4."
+                detail += " После t2 оба реле включаются; после t4 возвращаются в OFF."
             self.operation_mode_hint.set(base + " " + detail)
         elif self.devices:
             self.operation_mode_hint.set("Введите поток у нужного прибора и нажмите «Установить». «Ноль» прекращает подачу через этот MFC.")
@@ -1751,7 +1837,10 @@ class GasLineApp(tk.Tk):
         extra = "\nВ каждой точке записываются два спектра, каждый с ответным TTL от ЯМР."
         extra += f"\nt1={cycle.t1:g}, t2={cycle.t2:g}, t3={cycle.t3:g}, t4={cycle.t4:g} с."
         if valves_mode:
-            extra += "\nКлапан ИМИТИРУЕТСЯ: физических команд открытия и закрытия не будет."
+            if not self.arduino.relay_capable:
+                messagebox.showwarning("Обновите прошивку Arduino", "Загрузите arduino_nmr_ttl.ino с поддержкой реле D4/D5 и подключите Arduino заново.")
+                return
+            extra += "\nD4/D5 управляют двумя реле: после t2 питание обеих катушек включается, после t4 выключается."
         if alkene is None:
             prompt = (
                 f"Запустить {len(plan)} точек на MFC {h2.serial_number}?\n"
@@ -1769,7 +1858,7 @@ class GasLineApp(tk.Tk):
             arduino=self.arduino if arduino_mode else None,
             arduino_timeout_s=timeout_s,
             cycle=cycle,
-            valves=ValvePlaceholder(self.events) if valves_mode else None,
+            valves=ArduinoValveController(self.arduino, self.events) if valves_mode else None,
         )
         self.runner.start()
         self.progress_var.set("Запуск эксперимента…")
@@ -1834,11 +1923,14 @@ class GasLineApp(tk.Tk):
                     self._point_status(point.number, f"Спектр {spectrum}/2 принят")
                     self.progress_var.set(f"Точка {point.number}: спектр {spectrum}/2 подтверждён ответным TTL.")
                     self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {point.number}: spectrum {spectrum}/2 confirmed by returning NMR TTL.")
-                elif kind == "valve_placeholder":
-                    number, is_open = payload
-                    state = "открыт" if is_open else "закрыт"
-                    self.valve_status_var.set(f"Клапан: {state} (ИМИТАЦИЯ, команда не отправлялась).")
-                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  VALVE STUB · точка {number}: {state}; физическое управление не реализовано.")
+                elif kind == "valve_status":
+                    number, switched = payload
+                    if switched is None:
+                        self.valve_status_var.set("Реле D4/D5: состояние не подтверждено.")
+                    else:
+                        state = "ON: клапан 1 закрыт, клапан 2 открыт" if switched else "OFF: клапан 1 открыт, клапан 2 закрыт"
+                        self.valve_status_var.set(f"Arduino подтвердила реле {state}.")
+                        self._append_connection_log(f"{time.strftime('%H:%M:%S')}  RELAYS · точка {number}: {state}; подтверждены выходы, датчиков положения клапанов нет.")
                 elif kind == "point_completed":
                     self._point_status(payload.number, "Завершена")
                     self.progress_var.set(f"Точка {payload.number}: цикл завершён. Переход к следующей точке.")
@@ -1921,9 +2013,29 @@ class GasLineApp(tk.Tk):
     def _close(self) -> None:
         if self.runner and self.runner.is_alive():
             self.runner.cancel()
+            # Keep the two COM workers alive until the runner has sent OFF
+            # and zeroed MFCs. Closing them first would discard cleanup commands.
+            self.progress_var.set("Остановка перед закрытием: OFF реле и нулевой поток…")
+            if not getattr(self, "_close_pending", False):
+                self._close_pending = True
+                self.after(100, self._retry_close)
+            return
         self.service.shutdown()
         self.arduino.shutdown()
-        self.destroy()
+        self._shutdown_started = time.monotonic()
+        self._wait_for_workers()
+
+    def _retry_close(self) -> None:
+        self._close_pending = False
+        self._close()
+
+    def _wait_for_workers(self) -> None:
+        # Arduino's worker confirms OFF before it releases the port. The
+        # firmware timeout also covers a serial link lost during this wait.
+        if (self.service.is_alive() or self.arduino.is_alive()) and time.monotonic() - self._shutdown_started < 8:
+            self.after(100, self._wait_for_workers)
+        else:
+            self.destroy()
 
 
 def main() -> None:
