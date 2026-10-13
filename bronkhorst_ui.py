@@ -179,13 +179,13 @@ class CycleDiagram(tk.Canvas):
             active = self.active_stage == f"nmr{spectrum}"
             self.create_rectangle(x1, 120, x2, 158, fill="#fff1d6" if active else "#e8f1f5", outline=blue)
             self.create_text((x1 + x2) / 2, 139, text=f"Спектр №{spectrum}", fill=blue)
-        self.create_text(22, 184, anchor="w", text="Клапан (имитация)" if self.valves_enabled else "Клапан: не используется в этом режиме", fill=green if self.valves_enabled else grey)
+        self.create_text(22, 184, anchor="w", text="Питание двух клапанов (реле D4/D5)" if self.valves_enabled else "Реле: не используются в этом режиме", fill=green if self.valves_enabled else grey)
         if self.valves_enabled:
             self.create_line(40, 240, 450, 240, 450, 208, 880, 208, 880, 240, 900, 240, fill=green, width=2)
-            self.create_text(450, 253, text="Открыть", fill=green)
-            self.create_text(880, 253, text="Закрыть", fill=green)
-            self.create_text(250, 224, text="Закрыт", fill=grey)
-            self.create_text(665, 224, text="Открыт", fill=green)
+            self.create_text(450, 253, text="Реле ON", fill=green)
+            self.create_text(880, 253, text="Реле OFF", fill=green)
+            self.create_text(250, 224, text="24 В снято", fill=grey)
+            self.create_text(665, 224, text="24 В подано", fill=green)
         else:
             self.create_line(40, 240, 900, 240, fill=grey, dash=(5, 4))
         self.create_text(900, 120, anchor="e", text="После t4 →\nследующая точка", fill=grey)
@@ -214,8 +214,8 @@ def build_cycle_editor(app):
         entry.pack(fill="x", pady=(4, 0))
         app.cycle_entries[key] = entry
         app.plan_input_widgets.append(entry)
-    note(cycle, "t2: до открытия клапана; t3: после открытия; t4: до закрытия. Без клапанов действия открытия/закрытия пропускаются, задержки сохраняются.").pack(fill="x")
-    note(cycle, "Клапаны пока только имитируются в интерфейсе и журнале. Команды на Arduino, пины и электрическая схема управления ещё не реализованы.").pack(fill="x", pady=(6, 0))
+    note(cycle, "После t2: оба реле ON (клапан 1 закрыт, клапан 2 открыт). После t4: оба OFF (исходные положения). Без клапанов переключения пропускаются, задержки сохраняются.").pack(fill="x")
+    note(cycle, "Arduino подтверждает уровни выходов D4/D5, но положение клапанов отдельными датчиками не измеряется.").pack(fill="x", pady=(6, 0))
     actions = ttk.Frame(app.design_content)
     actions.pack(fill="x", pady=(4, 8))
     app.save_design_button = ttk.Button(actions, text="Сохранить дизайн", command=app._save_experiment_design)
@@ -351,7 +351,7 @@ def build_interface(app):
     app.arduino_connect_button.pack(side="left")
     ttk.Button(arduino_actions, text="Отключить", command=app._disconnect_arduino).pack(side="left", padx=8)
     note(app.arduino_frame, variable=app.arduino_status_var).pack(fill="x", pady=(4, 0))
-    note(app.arduino_frame, "Выход D8 · TTL 5 мс\nВход D2 · завершение записи").pack(fill="x", pady=(6, 0))
+    note(app.arduino_frame, "D8 · TTL 5 мс; D2 · ответ ЯМР\nD4 → IN1; D5 → IN2; LOW = реле ON").pack(fill="x", pady=(6, 0))
     app.design_summary_frame = section(left, "Дизайн эксперимента")
     ttk.Button(app.design_summary_frame, text="Открыть дизайн эксперимента ↗", command=app._open_design_window).pack(anchor="w")
     note(app.design_summary_frame, variable=app.design_summary_var).pack(fill="x", pady=(6, 0))

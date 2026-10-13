@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from bronkhorst_gui import ArduinoNMRService, ConfigStore, ExperimentPoint, ExperimentRunner
-from experiment_cycle import CycleTiming, OPERATION_LABELS, ValvePlaceholder
+from experiment_cycle import CycleTiming, OPERATION_LABELS, ArduinoValveController
 from test_arduino_protocol import ConfirmingArduino, FakeMFCService
 import test_manual_controls as manual_controls
 from test_manual_controls import device
@@ -33,7 +33,7 @@ class CycleTests(unittest.TestCase):
         mfc, arduino, events = FakeMFCService(), ConfirmingArduino(), queue.Queue()
         plan = [ExperimentPoint(1, 10, 8, 2, 0), ExperimentPoint(2, 20, 16, 4, 0)]
         runner = ExperimentRunner(mfc, plan, "H2", "ALKENE", events, arduino=arduino,
-                                  cycle=CycleTiming(0, 0, 0, 0), valves=ValvePlaceholder(events))
+                                  cycle=CycleTiming(0, 0, 0, 0), valves=ArduinoValveController(arduino, events))
         runner.run()
         observed = drain(events)
         sequence = []
@@ -42,7 +42,7 @@ class CycleTests(unittest.TestCase):
                 sequence.append(payload[1])
             elif kind == "nmr_trigger_wait":
                 sequence.append(f"nmr{payload[1]}")
-            elif kind == "valve_placeholder" and payload[0] > 0:
+            elif kind == "valve_status" and payload[0] > 0 and payload[1] is not None:
                 sequence.append("open" if payload[1] else "close")
             elif kind == "point_completed":
                 sequence.append("point_done")
@@ -51,9 +51,8 @@ class CycleTests(unittest.TestCase):
         self.assertEqual(mfc.commands, [("set", {"H2": 8, "ALKENE": 2}),
                                         ("set", {"H2": 16, "ALKENE": 4}),
                                         ("zero", {"H2": 16, "ALKENE": 4})])
-        self.assertEqual(len(arduino.calls), 4)
-        self.assertTrue(all(call[0] == "trigger" for call in arduino.calls))
-        self.assertFalse(runner.valves.is_open)
+        self.assertEqual(sum(call[0] == "trigger" for call in arduino.calls), 4)
+        self.assertFalse(runner.valves.is_switched)
         self.assertNotIn("runner_error", [kind for kind, _ in observed])
 
     def test_each_delay_runs_with_its_own_duration(self):
@@ -74,7 +73,7 @@ class CycleTests(unittest.TestCase):
                 timing[delay] = 30
                 runner = ExperimentRunner(mfc, [ExperimentPoint(1, 10, 10, 0, 0), ExperimentPoint(2, 20, 20, 0, 0)],
                                           "A", None, events, arduino=arduino,
-                                          cycle=CycleTiming(**timing), valves=ValvePlaceholder(events))
+                                          cycle=CycleTiming(**timing), valves=ArduinoValveController(arduino, events))
                 runner.start()
                 while True:
                     kind, payload = events.get(timeout=2)
@@ -84,23 +83,32 @@ class CycleTests(unittest.TestCase):
                 runner.join(timeout=2)
                 self.assertFalse(runner.is_alive())
                 self.assertEqual([name for name, _ in mfc.commands], ["set", "zero"])
-                self.assertFalse(runner.valves.is_open)
+                self.assertFalse(runner.valves.is_switched)
                 self.assertNotIn("point_completed", [kind for kind, _ in drain(events)])
 
-    def test_second_spectrum_failure_closes_stub_and_prevents_next_point(self):
+    def test_second_spectrum_failure_resets_relays_and_prevents_next_point(self):
         events, mfc = queue.Queue(), FakeMFCService()
         arduino = ConfirmingArduino()
-        arduino.submit = Mock(side_effect=[{}, TimeoutError("second spectrum timeout")])
+        original_submit = arduino.submit
+        count = 0
+        def fail_second(name, payload, timeout_s):
+            nonlocal count
+            if name == "trigger":
+                count += 1
+                if count == 2:
+                    raise TimeoutError("second spectrum timeout")
+            return original_submit(name, payload, timeout_s)
+        arduino.submit = fail_second
         runner = ExperimentRunner(mfc, [ExperimentPoint(1, 10, 10, 0, 0), ExperimentPoint(2, 20, 20, 0, 0)],
                                   "A", None, events, arduino=arduino,
-                                  cycle=CycleTiming(0, 0, 0, 0), valves=ValvePlaceholder(events))
+                                  cycle=CycleTiming(0, 0, 0, 0), valves=ArduinoValveController(arduino, events))
         runner.run()
         observed = drain(events)
         self.assertEqual(sum(kind == "spectrum_confirmed" for kind, _ in observed), 1)
         self.assertNotIn("point_completed", [kind for kind, _ in observed])
         self.assertEqual([name for name, _ in mfc.commands], ["set", "zero"])
-        self.assertFalse(runner.valves.is_open)
-        self.assertEqual([payload[1] for kind, payload in observed if kind == "valve_placeholder"], [False, True, False])
+        self.assertFalse(runner.valves.is_switched)
+        self.assertEqual([payload[1] for kind, payload in observed if kind == "valve_status" and payload[1] is not None], [False, True, False])
 
     def test_stop_waiting_for_either_spectrum_aborts_handshake(self):
         for spectrum in (1, 2):
@@ -111,8 +119,8 @@ class CycleTests(unittest.TestCase):
                 arduino._write_line = Mock()
                 runner = ExperimentRunner(mfc, [ExperimentPoint(1, 10, 10, 0, 0)], "A", None,
                                           events, cycle=CycleTiming(0, 0, 0, 0),
-                                          valves=ValvePlaceholder(events), arduino=arduino)
-                arduino.submit = lambda _name, payload, timeout_s: arduino._trigger_and_wait(payload)
+                                          valves=ArduinoValveController(arduino, events), arduino=arduino)
+                arduino.submit = lambda name, payload, timeout_s: (arduino._trigger_and_wait(payload) if name == "trigger" else {"switched": payload["switched"]})
                 responses = iter([f"TRIGGERED {runner.run_id}-s1 1", f"NMR_DONE {runner.run_id}-s1 1"] if spectrum == 2 else [])
 
                 def read_line():
@@ -126,7 +134,7 @@ class CycleTests(unittest.TestCase):
                 self.assertIn((f"ABORT {runner.run_id}-s{spectrum} 1",),
                               [call.args for call in arduino._write_line.call_args_list])
                 self.assertEqual(mfc.commands[-1][0], "zero")
-                self.assertFalse(runner.valves.is_open)
+                self.assertFalse(runner.valves.is_switched)
                 self.assertNotIn("point_completed", [kind for kind, _ in drain(events)])
 
     def test_late_first_spectrum_response_cannot_accept_second_spectrum(self):
@@ -169,7 +177,7 @@ class DesignWindowTests(unittest.TestCase):
         self.app.operation_mode.set("automatic-arduino-valves")
         self.app._operation_mode_changed()
         self.assertTrue(self.app.cycle_diagram.valves_enabled)
-        self.assertIn("имитация", self.app.valve_status_var.get())
+        self.assertIn("D4/D5", self.app.valve_status_var.get())
 
     def test_running_cycle_locks_design_and_save(self):
         self.app._update_devices([device()])

@@ -21,6 +21,8 @@ class ConfirmingArduino:
 
     def submit(self, name, payload, timeout_s):
         self.calls.append((name, payload, timeout_s))
+        if name == "valves":
+            return {"switched": payload["switched"]}
         return {"run_id": payload["run_id"], "point": payload["point"]}
 
 

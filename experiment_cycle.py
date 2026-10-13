@@ -1,4 +1,4 @@
-"""Timing model and a deliberately non-hardware valve placeholder."""
+"""Timing model and acknowledged Arduino relay control."""
 
 from dataclasses import dataclass
 import math
@@ -29,13 +29,26 @@ class CycleTiming:
         return self.t1 + self.t2 + self.t3 + self.t4
 
 
-class ValvePlaceholder:
-    """Records intended state changes; never opens a port or sends a command."""
+class ArduinoValveController:
+    """Switch both coils together, publishing only acknowledged output states.
 
-    def __init__(self, events):
+    False: both coils unpowered (valve 1 open, valve 2 closed).
+    True: both coils powered (valve 1 closed, valve 2 open).
+    This is Arduino output confirmation, not physical valve position feedback.
+    """
+
+    def __init__(self, arduino, events):
+        self.arduino = arduino
         self.events = events
-        self.is_open = False
+        self.is_switched = None
 
-    def set_open(self, is_open, point):
-        self.is_open = is_open
-        self.events.put(("valve_placeholder", (point, is_open)))
+    def set_switched(self, switched, point):
+        # A lost acknowledgement leaves the output state unknown. Cleanup must
+        # send OFF even when the previous confirmed state was already OFF.
+        self.is_switched = None
+        self.events.put(("valve_status", (point, None)))
+        result = self.arduino.submit("valves", {"switched": switched, "point": point}, timeout_s=5)
+        if result.get("switched") is not switched:
+            raise RuntimeError("Arduino не подтвердила требуемое состояние реле")
+        self.is_switched = switched
+        self.events.put(("valve_status", (point, switched)))

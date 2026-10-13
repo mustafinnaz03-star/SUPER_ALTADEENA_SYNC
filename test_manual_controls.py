@@ -60,6 +60,9 @@ class ManualControlsTests(unittest.TestCase):
         if hasattr(self, "app"):
             for timer in self.app.tk.call("after", "info"):
                 self.app.after_cancel(timer)
+            # Some layout checks install a perpetual is_alive() Mock runner.
+            # No hardware worker is started in these GUI tests.
+            self.app.runner = None
             self.app._close()
 
     def test_cards_follow_connected_devices_and_keep_typed_input(self):
