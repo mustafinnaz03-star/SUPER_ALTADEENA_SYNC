@@ -120,7 +120,7 @@ class CycleTests(unittest.TestCase):
                 runner = ExperimentRunner(mfc, [ExperimentPoint(1, 10, 10, 0, 0)], "A", None,
                                           events, cycle=CycleTiming(0, 0, 0, 0),
                                           valves=ArduinoValveController(arduino, events), arduino=arduino)
-                arduino.submit = lambda name, payload, timeout_s: (arduino._trigger_and_wait(payload) if name == "trigger" else {"switched": payload["switched"]})
+                arduino.submit = lambda name, payload, timeout_s: (arduino._trigger_and_wait(payload) if name == "trigger" else {"switched": payload["switched"], "relay_mask": payload["relay_mask"]})
                 responses = iter([f"TRIGGERED {runner.run_id}-s1 1", f"NMR_DONE {runner.run_id}-s1 1"] if spectrum == 2 else [])
 
                 def read_line():

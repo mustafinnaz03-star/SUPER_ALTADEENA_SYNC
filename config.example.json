@@ -21,6 +21,14 @@
     "startup_timeout_s": 8
   },
   "experiment": {
+    "plan_mode": "range",
+    "custom_flows": "100 110 110 110 120",
+    "point_repeats": 1,
+    "relay_mask": 1,
+    "relay_initial_on": false,
+    "recover_after_off": false,
+    "recovery_attempts": 3,
+    "recovery_interval_s": 1.0,
     "start": 10,
     "stop": 150,
     "step": 10,

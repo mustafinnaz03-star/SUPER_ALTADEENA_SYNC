@@ -22,7 +22,7 @@ class ConfirmingArduino:
     def submit(self, name, payload, timeout_s):
         self.calls.append((name, payload, timeout_s))
         if name == "valves":
-            return {"switched": payload["switched"]}
+            return {"switched": payload["switched"], "relay_mask": payload["relay_mask"]}
         return {"run_id": payload["run_id"], "point": payload["point"]}
 
 

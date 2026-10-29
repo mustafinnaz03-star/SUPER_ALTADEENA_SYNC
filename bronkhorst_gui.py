@@ -40,8 +40,8 @@ import propar
 import serial
 from serial.tools import list_ports
 
-from bronkhorst_ui import ROLE_LABELS, MODE_LABELS, build_interface, configure_style
-from experiment_cycle import AUTOMATIC_MODES, CYCLE_DEFAULTS, OPERATION_LABELS, CycleTiming, ArduinoValveController
+from bronkhorst_ui import ROLE_LABELS, MODE_LABELS, build_interface, configure_style, refresh_experiment_presentation
+from experiment_cycle import AUTOMATIC_MODES, CYCLE_DEFAULTS, OPERATION_LABELS, RELAY_SELECTION_LABELS, CycleTiming, ArduinoValveController, ArduinoRecoveryPolicy
 
 
 # FlowDDE parameter numbers, used by the EL-FLOW RS232/FLOW-BUS (ProPar) interface.
@@ -56,6 +56,33 @@ OPERATION_MODES = tuple(OPERATION_LABELS)
 ARDUINO_READY = "READY"
 ARDUINO_TRIGGERED = "TRIGGERED"
 ARDUINO_NMR_DONE = "NMR_DONE"
+ARDUINO_OFF_SETTLE_S = 1.0
+MAX_PLAN_POINTS = 10000
+
+
+def is_console_detail(message: str) -> bool:
+    """Hide known protocol chatter only; preserve unknown messages and faults."""
+    body = message.split("  ", 1)[-1].strip()
+    lower = body.casefold()
+    if any(marker in lower for marker in (
+        "error", "fail", "timeout", "ошиб", "не удалось", "не подтвержд",
+        "предупрежд", "внимание", "boot", "reset_cause",
+    )):
+        return False
+    if body.startswith(("ARDUINO: > ", "ARDUINO: < ", "COMMAND ", "OK ", "CONNECT requested ")):
+        return True
+    if body.startswith("UI:"):
+        return body.startswith(("UI: connect button pressed ", "UI: disconnect button pressed ",
+                                "UI: Arduino connect requested ", "UI: connect_port completed ",
+                                "UI: disconnect_port completed "))
+    if body.startswith(("ARDUINO: Opening ", "ARDUINO: Реле:")):
+        return True
+    if body.startswith("ARDUINO: Точка ") and (
+        "подтвердила отправку TTL" in body or "получен ответный TTL" in body
+    ):
+        # The runner already reports each numbered spectrum and confirmation.
+        return True
+    return "identification reply" in lower
 
 # A busy COM port is an expected state during discovery (for example when
 # FlowSuite is open). It is reported in the GUI rather than printed repeatedly.
@@ -131,7 +158,10 @@ def build_plan(start: float, stop: float, step: float, ratio: float, dwell_s: fl
         raise ValueError("Параметры плана должны быть конечными числами")
     if start < 0 or stop < start or step <= 0 or ratio <= 0 or dwell_s < 0:
         raise ValueError("Начальный поток: от 0 до конечного; шаг и соотношение — больше нуля; t1 — не меньше нуля")
-    count = int(math.floor((stop - start) / step + 1e-9)) + 1
+    steps = (stop - start) / step
+    if not math.isfinite(steps) or steps > MAX_PLAN_POINTS - 1 + 1e-9:
+        raise ValueError(f"План не должен содержать больше {MAX_PLAN_POINTS} точек")
+    count = int(math.floor(steps + 1e-9)) + 1
     totals = [round(start + index * step, 9) for index in range(count)]
     if not math.isclose(totals[-1], stop, abs_tol=1e-7):
         raise ValueError("Разница конечного и начального потоков должна делиться на шаг")
@@ -147,11 +177,51 @@ def build_single_mfc_plan(start: float, stop: float, step: float, dwell_s: float
         raise ValueError("Параметры плана должны быть конечными числами")
     if start < 0 or stop < start or step <= 0 or dwell_s < 0:
         raise ValueError("Начальный поток: от 0 до конечного; шаг — больше нуля; t1 — не меньше нуля")
-    count = int(math.floor((stop - start) / step + 1e-9)) + 1
+    steps = (stop - start) / step
+    if not math.isfinite(steps) or steps > MAX_PLAN_POINTS - 1 + 1e-9:
+        raise ValueError(f"План не должен содержать больше {MAX_PLAN_POINTS} точек")
+    count = int(math.floor(steps + 1e-9)) + 1
     totals = [round(start + index * step, 9) for index in range(count)]
     if not math.isclose(totals[-1], stop, abs_tol=1e-7):
         raise ValueError("Разница конечного и начального потоков должна делиться на шаг")
     return [ExperimentPoint(i + 1, total, total, 0.0, dwell_s) for i, total in enumerate(totals)]
+
+
+def build_custom_plan(flows: str, ratio: float, dwell_s: float, single_mfc: bool = False) -> list[ExperimentPoint]:
+    """Preserve the entered order and duplicates; commas are decimal marks."""
+    tokens = flows.replace(";", " ").split()
+    if not tokens:
+        raise ValueError("Введите список потоков, например: 100 110 110 110 120")
+    if len(tokens) > MAX_PLAN_POINTS:
+        raise ValueError(f"План не должен содержать больше {MAX_PLAN_POINTS} точек")
+    if not math.isfinite(dwell_s) or dwell_s < 0:
+        raise ValueError("t1 должна быть конечным числом не меньше нуля")
+    if not single_mfc and (not math.isfinite(ratio) or ratio <= 0):
+        raise ValueError("Соотношение H₂ : алкен должно быть конечным числом больше нуля")
+    plan = []
+    for number, token in enumerate(tokens, 1):
+        try:
+            total = float(token.replace(",", "."))
+        except ValueError as exc:
+            raise ValueError(f"Точка {number}: неверный поток «{token}». Разделяйте числа пробелами или ;") from exc
+        if not math.isfinite(total) or total < 0:
+            raise ValueError(f"Точка {number}: поток должен быть конечным числом не меньше нуля")
+        h2 = total if single_mfc else total * (ratio / (1 + ratio))
+        alkene = 0.0 if single_mfc else total / (1 + ratio)
+        plan.append(ExperimentPoint(number, total, h2, alkene, dwell_s))
+    return plan
+
+
+def repeat_plan_points(plan: list[ExperimentPoint], repeats: int = 1) -> list[ExperimentPoint]:
+    """Repeat EACH point consecutively, assigning unique acquisition numbers."""
+    if type(repeats) is not int or not 1 <= repeats <= MAX_PLAN_POINTS:
+        raise ValueError(f"Повтор каждой точки: целое число от 1 до {MAX_PLAN_POINTS}")
+    if not plan:
+        raise ValueError("План должен содержать хотя бы одну точку")
+    if len(plan) * repeats > MAX_PLAN_POINTS:
+        raise ValueError(f"С учётом повторов допускается не больше {MAX_PLAN_POINTS} точек")
+    return [replace(point, number=index * repeats + repetition + 1)
+            for index, point in enumerate(plan) for repetition in range(repeats)]
 
 
 class ConfigStore:
@@ -224,7 +294,7 @@ class ConfigStore:
         self.raw["arduino"] = self.arduino
         self.path.write_text(json.dumps(self.raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
-    def save_experiment(self, settings: dict[str, float]) -> None:
+    def save_experiment(self, settings: dict[str, Any]) -> None:
         self.experiment = dict(settings)
         self.raw["experiment"] = self.experiment
         self.path.write_text(json.dumps(self.raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -550,6 +620,7 @@ class ArduinoNMRService(threading.Thread):
         self.port: serial.Serial | None = None
         self.ready = False
         self.relay_capable = False
+        self.relay_selection_capable = False
         self.last_keepalive = 0.0
 
     def _log(self, message: str) -> None:
@@ -561,6 +632,7 @@ class ArduinoNMRService(threading.Thread):
     def _close_port(self) -> None:
         self.ready = False
         self.relay_capable = False
+        self.relay_selection_capable = False
         if self.port is not None:
             try:
                 self.port.close()
@@ -583,31 +655,118 @@ class ArduinoNMRService(threading.Thread):
         self.port.flush()
         self._log(f"> {line}")
 
-    def _connect(self, settings: dict[str, Any]) -> None:
+    def _check_cancelled(self, cancel_event=None) -> None:
+        if self.stopping.is_set() or (cancel_event is not None and cancel_event.is_set()):
+            raise InterruptedError("Восстановление/проверка Arduino остановлена оператором")
+
+    def _connect(self, settings: dict[str, Any], cancel_event=None, deadline: float | None = None) -> None:
         port = str(settings.get("port", "")).strip()
         if not port:
             raise ValueError("Choose an Arduino COM port")
         baudrate = int(settings.get("baudrate", 115200))
         startup_timeout = float(settings.get("startup_timeout_s", 8.0))
+        self._check_cancelled(cancel_event)
         self._close_port()
         self._status(f"Подключение Arduino: {port}, {baudrate} бод…")
         self._log(f"Opening {port} at {baudrate} baud.")
         self.port = serial.Serial(port=port, baudrate=baudrate, timeout=0.1, write_timeout=1)
         self.settings = {**self.settings, **settings, "port": port, "baudrate": baudrate}
-        deadline = time.monotonic() + startup_timeout
-        while time.monotonic() < deadline:
+        startup_deadline = time.monotonic() + startup_timeout
+        if deadline is not None:
+            startup_deadline = min(startup_deadline, deadline)
+        while time.monotonic() < startup_deadline:
+            self._check_cancelled(cancel_event)
             line = self._read_line()
             if line is None:
                 continue
             self._log(f"< {line}")
             if line == "CAPABILITIES NMR RELAYS_D4_D5":
                 self.relay_capable = True
+            if line == "CAPABILITY RELAY_MASK":
+                self.relay_selection_capable = True
             if line == ARDUINO_READY:
                 self.ready = True
                 self._status(f"Arduino готова · {port}")
                 return
         self._close_port()
         raise TimeoutError(f"Arduino did not send '{ARDUINO_READY}' within {startup_timeout:g} s")
+
+    def _off_checkpoint(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Catch delayed USB/reset faults after OFF, then require a fresh ACK.
+
+        This command never energizes a relay and never issues a TTL trigger.
+        Recovery is only requested at t1, t4 or the final OFF boundary.
+        """
+        cancel_event = payload.get("cancel_event")
+        deadline = payload.get("deadline", float("inf"))
+        settle_until = time.monotonic() + ARDUINO_OFF_SETTLE_S
+        while time.monotonic() < settle_until:
+            self._check_cancelled(cancel_event)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Истекло время восстановления Arduino")
+            if not self.ready:
+                raise ConnectionError("Arduino потеряла готовность после OFF")
+            self._keepalive()
+            line = self._read_line()
+            if line:
+                self._log(f"< {line}")
+                self._check_board_fault(line)
+        self._check_cancelled(cancel_event)
+        result = self._set_valves({"switched": False, "relay_mask": 3,
+                                   "cancel_event": cancel_event, "deadline": deadline})
+        self._check_cancelled(cancel_event)
+        return result
+
+    def _recover_off(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Bounded reconnect to the existing port, ending with confirmed all-OFF."""
+        cancel_event = payload.get("cancel_event")
+        # An absolute deadline also prevents a delayed queued command from
+        # reconnecting after its caller has already timed out.
+        deadline = payload["deadline"]
+        policy = ArduinoRecoveryPolicy(payload.get("max_attempts", 3), payload.get("retry_interval_s", 1.0))
+        offset = payload.get("attempt_offset", 0)
+        total_limit = offset + policy.attempts
+        cycle_label = f"цикл {payload['point']}" if "point" in payload else "текущий цикл"
+        settings = dict(self.settings)
+        attempt = 0
+        self._close_port()
+        try:
+            while attempt < policy.attempts and time.monotonic() < deadline:
+                self._check_cancelled(cancel_event)
+                # Let Windows/USB finish re-enumeration before the first open,
+                # not just between failed opens. Never shorten this cooldown.
+                if deadline - time.monotonic() < policy.interval_s:
+                    raise TimeoutError("Недостаточно времени для полной паузы перед подключением Arduino")
+                self._log(f"Жду {policy.interval_s:g} с перед подключением к Arduino ({cycle_label}, попытка {offset + attempt + 1}/{total_limit}).")
+                wait_event = self.stopping if cancel_event is None else cancel_event
+                wait_event.wait(policy.interval_s)
+                self._check_cancelled(cancel_event)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Истекло время ожидания подключения Arduino")
+                attempt += 1
+                self._log(f"Пробую подключиться к Arduino: {settings.get('port')}, {cycle_label}, попытка {offset + attempt}/{total_limit}.")
+                try:
+                    self._connect(settings, cancel_event=cancel_event, deadline=deadline)
+                    if not self.relay_capable or not self.relay_selection_capable:
+                        raise RuntimeError("После переподключения нет поддержки реле RELAY_MASK; продолжение запрещено")
+                    self._set_valves({"switched": False, "relay_mask": 3,
+                                      "cancel_event": cancel_event, "deadline": deadline})
+                    result = self._off_checkpoint(payload)
+                    self._check_cancelled(cancel_event)
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Истекло время восстановления Arduino")
+                    self._log("Восстановление завершено: READY и OFF обоих реле подтверждены.")
+                    return {**result, "attempts_used": attempt}
+                except InterruptedError:
+                    raise
+                except (OSError, TimeoutError) as exc:
+                    self._log(f"Попытка восстановления не удалась: {exc}")
+                    self._close_port()
+            self._check_cancelled(cancel_event)
+            raise TimeoutError(f"Не удалось подключиться к Arduino: выполнено {attempt} из {policy.attempts} оставшихся попыток; эксперимент остановлен")
+        except Exception:
+            self._close_port()
+            raise
 
     def _keepalive(self) -> None:
         if self.ready and self.relay_capable and time.monotonic() - self.last_keepalive >= 1:
@@ -620,18 +779,31 @@ class ArduinoNMRService(threading.Thread):
     def _check_board_fault(self, line: str) -> None:
         if line == "READY" or line.startswith(("BOOT", "FAILSAFE")):
             self.ready = False
-            self.events.put(("valve_status", (0, None)))
+            self.events.put(("valve_status", (0, None, None)))
             raise ConnectionError("Arduino перезапустилась или потеряла связь. Подключите её заново; реле переведены прошивкой в OFF.")
 
     def _set_valves(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not self.ready or not self.relay_capable:
             raise ConnectionError("Нужна готовая Arduino с новой прошивкой TTL + реле D4/D5")
         switched = bool(payload["switched"])
+        relay_mask = payload.get("relay_mask", 3)
+        if type(relay_mask) is not int or relay_mask not in (1, 2, 3):
+            raise ValueError("Недопустимый выбор реле")
+        if not self.relay_selection_capable and (switched or relay_mask != 3):
+            raise ConnectionError("Обновите прошивку Arduino: требуется поддержка выбора реле (RELAY_MASK)")
         token = uuid4().hex[:16]
         state = "ON" if switched else "OFF"
-        self._write_line(f"VALVES {token} {state}")
-        deadline = time.monotonic() + 3
+        selection = f" {relay_mask}" if self.relay_selection_capable else ""
+        cancel_event = payload.get("cancel_event")
+        if cancel_event is not None:
+            self._check_cancelled(cancel_event)
+        deadline = min(time.monotonic() + 3, payload.get("deadline", float("inf")))
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Истекло время команды OFF/восстановления Arduino")
+        self._write_line(f"VALVES {token} {state}{selection}")
         while time.monotonic() < deadline:
+            if cancel_event is not None:
+                self._check_cancelled(cancel_event)
             self._keepalive()
             line = self._read_line()
             if not line:
@@ -643,10 +815,11 @@ class ArduinoNMRService(threading.Thread):
                 if fields[0] == "ERROR":
                     raise RuntimeError(f"Arduino: {line}")
                 if fields[0] == "VALVES_ACK":
-                    if fields[2:] != [state]:
+                    expected = [state, str(relay_mask)] if self.relay_selection_capable else [state]
+                    if fields[2:] != expected:
                         raise RuntimeError("Arduino подтвердила другое состояние реле")
-                    self._log(f"Реле D4/D5: {state} подтверждено Arduino.")
-                    return {"switched": switched}
+                    self._log(f"Реле: {state}, выбор={relay_mask} подтверждено Arduino.")
+                    return {"switched": switched, "relay_mask": relay_mask}
         # Never enqueue a second command behind an unacknowledged ON command.
         # Worker-side timeout is shorter than the submit() timeout.
         raise TimeoutError("Нет подтверждения переключения реле D4/D5")
@@ -709,6 +882,10 @@ class ArduinoNMRService(threading.Thread):
                 command.result = self._trigger_and_wait(command.payload or {})
             elif command.name == "valves":
                 command.result = self._set_valves(command.payload or {})
+            elif command.name == "off_checkpoint":
+                command.result = self._off_checkpoint(command.payload or {})
+            elif command.name == "recover_off":
+                command.result = self._recover_off(command.payload or {})
             elif command.name == "disconnect":
                 if self.ready and self.relay_capable:
                     self._set_valves({"switched": False})
@@ -721,7 +898,8 @@ class ArduinoNMRService(threading.Thread):
         except Exception as exc:
             command.error = exc
             self._status(f"Ошибка Arduino: {exc}")
-            if command.name == "valves":
+            self._log(f"Ошибка команды {command.name}: {exc}")
+            if command.name in ("valves", "off_checkpoint", "recover_off"):
                 # Stop renewing the host lease after an unconfirmed relay
                 # command. Try OFF once; a broken link times out on the board.
                 try:
@@ -729,7 +907,7 @@ class ArduinoNMRService(threading.Thread):
                 except Exception:
                     pass
                 self.ready = False
-                self.events.put(("valve_status", (0, None)))
+                self.events.put(("valve_status", (0, None, None)))
         finally:
             if command.done:
                 command.done.set()
@@ -759,8 +937,9 @@ class ArduinoNMRService(threading.Thread):
                                 self._check_board_fault(line)
                         except Exception as exc:
                             self.ready = False
-                            self.events.put(("valve_status", (0, None)))
+                            self.events.put(("valve_status", (0, None, None)))
                             self._status(f"Ошибка связи Arduino: {exc}")
+                            self._log(f"Ошибка связи Arduino: {exc}")
         finally:
             if self.ready and self.relay_capable:
                 try:
@@ -774,11 +953,19 @@ class ArduinoNMRService(threading.Thread):
 
 
 class ExperimentRunner(threading.Thread):
-    def __init__(self, service: SerialService, plan: list[ExperimentPoint], h2_serial: str, alkene_serial: str | None, events: queue.Queue[tuple[str, Any]], arduino: ArduinoNMRService | None = None, arduino_timeout_s: float = 180.0, cycle: CycleTiming | None = None, valves: ArduinoValveController | None = None):
+    def __init__(self, service: SerialService, plan: list[ExperimentPoint], h2_serial: str, alkene_serial: str | None, events: queue.Queue[tuple[str, Any]], arduino: ArduinoNMRService | None = None, arduino_timeout_s: float = 180.0, cycle: CycleTiming | None = None, valves: ArduinoValveController | None = None, recover_after_off: bool = False, recovery_policy: ArduinoRecoveryPolicy | None = None, relay_initial_on: bool = False):
         super().__init__(daemon=True)
+        if type(relay_initial_on) is not bool:
+            raise ValueError("Начальное состояние реле должно быть ON или OFF")
         self.service, self.plan, self.h2_serial, self.alkene_serial, self.events = service, plan, h2_serial, alkene_serial, events
         self.arduino, self.arduino_timeout_s = arduino, arduino_timeout_s
         self.cycle, self.valves = cycle, valves
+        self.relay_initial_on = relay_initial_on
+        self.recover_after_off = recover_after_off
+        self.recovery_used = False
+        self.recovery_policy = recovery_policy or ArduinoRecoveryPolicy()
+        self.recovery_attempts_used = 0
+        self.t4_interrupted_points: set[int] = set()
         self.cancelled = threading.Event()
         self.run_id = f"run-{uuid4().hex[:16]}"
 
@@ -815,6 +1002,98 @@ class ExperimentRunner(threading.Thread):
             raise InterruptedError("Stopped by operator")
         self.events.put(("spectrum_confirmed", (point, spectrum)))
 
+    def _recover_boundary(self, point: ExperimentPoint, controlled: dict[str, float], stage: str, exc: Exception) -> None:
+        if not self.recover_after_off or self.arduino is None or self.valves is None:
+            raise exc
+        if self.cancelled.is_set():
+            raise InterruptedError("Stopped by operator") from exc
+        self.events.put(("recovery_status", (point.number, f"Сбой на {stage}: {exc}. Отправка нулевого потока…")))
+        # Zero is mandatory even if this cycle's attempt budget is exhausted.
+        self.service.submit("zero", controlled)
+        remaining = self.recovery_policy.attempts - self.recovery_attempts_used
+        if remaining <= 0:
+            raise ConnectionError(f"Исчерпаны все попытки подключения к Arduino в цикле {point.number} ({self.recovery_policy.attempts}); эксперимент остановлен") from exc
+        if self.cancelled.is_set():
+            raise InterruptedError("Stopped by operator")
+        policy = ArduinoRecoveryPolicy(remaining, self.recovery_policy.interval_s)
+        budget_s = policy.budget_s(float(getattr(self.arduino, "settings", {}).get("startup_timeout_s", 8)))
+        self.events.put(("recovery_status", (point.number, f"Нулевая уставка принята MFC. Пауза перед подключением: {policy.interval_s:g} с; осталось попыток в цикле: {remaining}.")))
+        result = self.arduino.submit("recover_off", {
+            "cancel_event": self.cancelled,
+            "deadline": time.monotonic() + budget_s,
+            "max_attempts": remaining,
+            "retry_interval_s": policy.interval_s,
+            "attempt_offset": self.recovery_attempts_used,
+            "point": point.number,
+        }, timeout_s=budget_s + 2)
+        if self.cancelled.is_set():
+            raise InterruptedError("Stopped by operator")
+        if result.get("switched") is not False or result.get("relay_mask") != 3 or not self.arduino.ready:
+            raise ConnectionError("Восстановление не подтвердило готовность Arduino и OFF обоих реле")
+        used = result.get("attempts_used")
+        if type(used) is not int or not 1 <= used <= remaining:
+            raise RuntimeError("Некорректный счётчик попыток восстановления Arduino")
+        self.recovery_attempts_used += used
+        self.recovery_used = True
+        self.valves.is_switched = False
+        self.events.put(("valve_status", (point.number, False, 3)))
+        self.events.put(("recovery_status", (point.number, f"Arduino подключена, оба реле OFF. Использовано попыток в цикле: {self.recovery_attempts_used}/{self.recovery_policy.attempts}.")))
+
+    def _wait_initial_delay(self, point: ExperimentPoint, seconds: float, controlled: dict[str, float]) -> None:
+        while True:
+            try:
+                self._wait_delay(point, "t1", seconds)
+                return
+            except InterruptedError:
+                raise
+            except (OSError, TimeoutError) as exc:
+                self._recover_boundary(point, controlled, "t1", exc)
+                if self.cancelled.is_set():
+                    raise InterruptedError("Stopped by operator")
+                if self.valves is not None and self.valves.is_switched is not self.relay_initial_on:
+                    # Re-establish the designed first-spectrum state BEFORE gas
+                    # is reapplied. A failed ON aborts; it is never auto-retried.
+                    self.valves.set_switched(self.relay_initial_on, point.number)
+                if self.cancelled.is_set():
+                    raise InterruptedError("Stopped by operator")
+                self.service.submit("set", controlled)
+                self.events.put(("recovery_status", (point.number, "Поток задан заново. Выдержка t1 начинается с нуля; TTL ещё не отправлялся.")))
+
+    def _wait_final_delay(self, point: ExperimentPoint, seconds: float, controlled: dict[str, float]) -> bool:
+        try:
+            self._wait_delay(point, "t4", seconds)
+            return False
+        except InterruptedError:
+            raise
+        except (OSError, TimeoutError) as exc:
+            self._recover_boundary(point, controlled, "t4", exc)
+            # A reset has interrupted the designed relay hold. Never silently
+            # treat it as a normal t4 or re-energize a valve after both spectra.
+            self.t4_interrupted_points.add(point.number)
+            self.events.put(("recovery_status", (point.number, "ВНИМАНИЕ: t4 прервана. Оба спектра уже приняты; реле остаются OFF. Переход к следующей точке без повторной записи спектров.")))
+            return True
+
+    def _finish_valve_point(self, point: ExperimentPoint, controlled: dict[str, float], next_point: bool = False) -> None:
+        """Called ONLY after both NMR acknowledgements and the full t4 delay."""
+        if self.cancelled.is_set():
+            raise InterruptedError("Stopped by operator")
+        if self.relay_initial_on and next_point:
+            # Only a fully completed t4 permits normal ON for the next point.
+            # Keep this outside OFF recovery: a failed ON must stop the run.
+            self.valves.set_switched(True, point.number)
+            return
+        try:
+            self.valves.set_switched(False, point.number)
+            if self.recover_after_off:
+                self.events.put(("recovery_status", (point.number, "Проверка связи после OFF (1 с)…")))
+                result = self.arduino.submit("off_checkpoint", {"cancel_event": self.cancelled}, timeout_s=5)
+                if result != {"switched": False, "relay_mask": 3}:
+                    raise RuntimeError("Нет подтверждения OFF обоих реле на границе точки")
+        except InterruptedError:
+            raise
+        except (OSError, TimeoutError) as exc:
+            self._recover_boundary(point, controlled, "завершающем OFF", exc)
+
     def run(self) -> None:
         controlled = {self.h2_serial: 0.0}
         if self.alkene_serial is not None:
@@ -823,9 +1102,20 @@ class ExperimentRunner(threading.Thread):
         try:
             if self.valves is not None and self.arduino is None:
                 raise ValueError("Valve mode requires the NMR/Arduino handshake")
+            if self.cancelled.is_set():
+                raise InterruptedError("Stopped by operator")
             if self.valves is not None:
-                self.valves.set_switched(False, 0)
-            for point in self.plan:
+                self.valves.set_switched(self.relay_initial_on and bool(self.plan), 0)
+            for point_index, point in enumerate(self.plan):
+                if self.cancelled.is_set():
+                    raise InterruptedError("Stopped by operator")
+                # One cycle is one plan point (t1, both spectra, t2–t4, boundary).
+                # Repeated faults within the same t1 must share this budget.
+                self.recovery_attempts_used = 0
+                if self.valves is not None and self.valves.is_switched is not self.relay_initial_on:
+                    # A recovered/interrupted t4 leaves both outputs OFF.
+                    # Apply the first state explicitly at the next point.
+                    self.valves.set_switched(self.relay_initial_on, point.number)
                 if self.cancelled.is_set():
                     raise InterruptedError("Stopped by operator")
                 controlled = {self.h2_serial: point.h2_flow}
@@ -835,22 +1125,23 @@ class ExperimentRunner(threading.Thread):
                 started = time.monotonic()
                 self.events.put(("stage", (point, started)))
                 timing = self.cycle or CycleTiming(t1=point.dwell_s)
-                self._wait_delay(point, "t1", timing.t1)
+                self._wait_initial_delay(point, timing.t1, controlled)
                 if self.arduino is not None:
                     self._record_spectrum(point, 1)
                     self._wait_delay(point, "t2", timing.t2)
                     if self.valves is not None:
                         if self.cancelled.is_set():
                             raise InterruptedError("Stopped by operator")
-                        self.valves.set_switched(True, point.number)
+                        self.valves.set_switched(not self.relay_initial_on, point.number)
                     self._wait_delay(point, "t3", timing.t3)
                     self._record_spectrum(point, 2)
-                    self._wait_delay(point, "t4", timing.t4)
-                    if self.valves is not None:
-                        self.valves.set_switched(False, point.number)
+                    t4_interrupted = self._wait_final_delay(point, timing.t4, controlled)
+                    if self.valves is not None and not t4_interrupted:
+                        self._finish_valve_point(point, controlled, next_point=point_index + 1 < len(self.plan))
                 if self.cancelled.is_set():
                     raise InterruptedError("Stopped by operator")
-                self.events.put(("point_completed", point))
+                event = "point_completed_warning" if point.number in self.t4_interrupted_points else "point_completed"
+                self.events.put((event, point))
             completed = True
         except Exception as exc:
             self.events.put(("runner_error", str(exc)))
@@ -863,7 +1154,8 @@ class ExperimentRunner(threading.Thread):
             try:
                 self.service.submit("zero", controlled)
                 if completed:
-                    self.events.put(("finished", "План завершён. Приборы приняли команду нулевого потока."))
+                    warning = (" Внимание: t4 прервана в точках " + ", ".join(map(str, sorted(self.t4_interrupted_points))) + ".") if self.t4_interrupted_points else ""
+                    self.events.put(("finished", "План завершён. Приборы приняли команду нулевого потока." + warning))
             except Exception as exc:
                 self.events.put(("runner_error", f"Не удалось задать нулевой поток: {exc}"))
 
@@ -1019,6 +1311,14 @@ class GasLineApp(tk.Tk):
         self.arduino_timeout_var = tk.StringVar(value=str(self.arduino_settings["spectrum_timeout_s"]))
         self.arduino_status_var = tk.StringVar(value="Arduino не подключена.")
         self.arduino_connecting = False
+        self.relay_test_pending = False
+        self.relay_test_cancel: threading.Event | None = None
+        self.relay_test_mode = self.operation_mode.get()
+        self.relay_test_status_var = tk.StringVar(value="Проверка реле: подключите Arduino. Расходомер не требуется.")
+        self.manual_valve_pending = False
+        self.manual_valve_cancel: threading.Event | None = None
+        self.manual_valve_requires_off = False
+        self.manual_valve_status_var = tk.StringVar(value="Подключите Arduino. Состояние реле не подтверждено.")
         self.manual_cards: dict[str, ManualFlowCard] = {}
         self.role_device_var, self.role_var = tk.StringVar(value="Нет приборов"), tk.StringVar(value="Unassigned")
         self.device_mode_var = tk.StringVar(value="Read flow")
@@ -1031,11 +1331,24 @@ class GasLineApp(tk.Tk):
         self.fluid_conditions_var = tk.StringVar(value="Выберите подключённый прибор в таблице.")
         self._conditions_snapshot: tuple[Any, ...] | None = None
         saved_design = getattr(store, "experiment", {})
+        self.recover_after_off_var = tk.BooleanVar(value=saved_design.get("recover_after_off") is True)
+        self.recovery_attempts_var = tk.StringVar(value=str(saved_design.get("recovery_attempts", 3)))
+        self.recovery_interval_var = tk.StringVar(value=str(saved_design.get("recovery_interval_s", 1.0)))
+        saved_relay_mask = str(saved_design.get("relay_mask", 1))
+        self.relay_selection_var = tk.StringVar(value=saved_relay_mask if saved_relay_mask in RELAY_SELECTION_LABELS else "1")
+        self.relay_initial_on_var = tk.BooleanVar(value=saved_design.get("relay_initial_on") is True)
+        self.relay_cycle_hint_var = tk.StringVar()
+        self.relay_wiring_var = tk.StringVar()
         self.plan_vars = {key: tk.StringVar(value=str(saved_design.get(key, value))) for key, value in {"start": 10, "stop": 150, "step": 10, "ratio": 4}.items()}
+        saved_plan_mode = saved_design.get("plan_mode", "range")
+        self.plan_mode_var = tk.StringVar(value=saved_plan_mode if saved_plan_mode in ("range", "custom") else "range")
+        self.custom_flows_var = tk.StringVar(value=str(saved_design.get("custom_flows", "")))
+        self.point_repeats_var = tk.StringVar(value=str(saved_design.get("point_repeats", 1)))
         self.cycle_vars = {key: tk.StringVar(value=str(saved_design.get(key, value))) for key, value in CYCLE_DEFAULTS.items()}
         # The existing gas-plan model calls the initial stabilization time dwell.
         self.plan_vars["dwell"] = self.cycle_vars["t1"]
         self.design_summary_var = tk.StringVar()
+        self.design_overview_var = tk.StringVar()
         self.design_status_var = tk.StringVar(value="Настройте потоки и задержки, затем сохраните дизайн.")
         self.valve_status_var = tk.StringVar(value="Клапан: не используется в этом режиме.")
         self.active_cycle_stage: str | None = None
@@ -1052,11 +1365,22 @@ class GasLineApp(tk.Tk):
         self.manual_setpoints: dict[str, float] = {}
         self.manual_commands_pending: set[str] = set()
         self._connection_log_lines: list[str] = []
+        self.short_logs_var = tk.BooleanVar(value=False)
+        self.console_mode_var = tk.StringVar(value="Журнал · все сообщения")
         self._build()
+        self.short_logs_var.trace_add("write", self._refresh_console)
         for variable in {**self.plan_vars, **self.cycle_vars}.values():
             if variable is not self.plan_vars["dwell"]:
                 variable.trace_add("write", self._design_changed)
         self.cycle_vars["t1"].trace_add("write", self._design_changed)
+        self.relay_selection_var.trace_add("write", self._relay_selection_changed)
+        self.relay_initial_on_var.trace_add("write", self._relay_sequence_changed)
+        self.plan_mode_var.trace_add("write", self._plan_source_changed)
+        self.custom_flows_var.trace_add("write", self._design_changed)
+        self.point_repeats_var.trace_add("write", self._design_changed)
+        self.recover_after_off_var.trace_add("write", self._design_changed)
+        self.recovery_attempts_var.trace_add("write", self._design_changed)
+        self.recovery_interval_var.trace_add("write", self._design_changed)
         self._update_design_summary()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.service.start()
@@ -1085,11 +1409,165 @@ class GasLineApp(tk.Tk):
             raise ValueError("Задержки t1–t4 должны быть числами (в секундах)") from exc
         return CycleTiming(**values)
 
+    def _selected_relay_mask(self) -> int:
+        value = self.relay_selection_var.get()
+        if value not in RELAY_SELECTION_LABELS:
+            raise ValueError("Выберите одно реле (D4 или D5) либо два реле")
+        return int(value)
+
+    def _current_recovery_policy(self) -> ArduinoRecoveryPolicy:
+        try:
+            return ArduinoRecoveryPolicy(int(self.recovery_attempts_var.get()),
+                                         float(self.recovery_interval_var.get().replace(",", ".")))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Попытки Arduino: целое число 1–100; интервал: 0,1–60 с") from exc
+
+    def _relay_selection_changed(self, *_args) -> None:
+        self.valve_status_var.set("Выбор реле изменён; состояние ещё не подтверждено.")
+        self._design_changed()
+        self._update_operation_mode_controls()
+        self.cycle_diagram.redraw()
+
+    def _relay_sequence_changed(self, *_args) -> None:
+        self._design_changed()
+        self._update_operation_mode_controls()
+
+    def _plan_source_changed(self, *_args) -> None:
+        self._design_changed()
+        self._update_operation_mode_controls()
+
+    def _current_point_repeats(self) -> int:
+        try:
+            repeats = int(self.point_repeats_var.get().strip())
+        except ValueError as exc:
+            raise ValueError(f"Повтор каждой точки: целое число от 1 до {MAX_PLAN_POINTS}") from exc
+        if not 1 <= repeats <= MAX_PLAN_POINTS:
+            raise ValueError(f"Повтор каждой точки: целое число от 1 до {MAX_PLAN_POINTS}")
+        return repeats
+
+    def _relay_cycle_description(self) -> str:
+        if self.relay_initial_on_var.get():
+            return "Сначала ON; после t2 → OFF; после t4 → ON только для следующей точки. Конец опыта / Стоп / ошибка → OFF."
+        return "Сначала OFF; после t2 → ON; после t4 → OFF. Конец опыта / Стоп / ошибка → OFF."
+
+    def _request_relay_test(self, pulse: bool = True) -> None:
+        if self.manual_valve_pending or (pulse and self.manual_valve_requires_off):
+            if not pulse:
+                self._request_manual_valve(False)
+            else:
+                self.relay_test_status_var.set("Сначала завершите ручную команду и выключите реле.")
+            return
+        if self.runner and self.runner.is_alive():
+            self.relay_test_status_var.set("Проверка недоступна: эксперимент выполняется.")
+            return
+        if self.relay_test_pending:
+            if not pulse and self.relay_test_cancel is not None:
+                self.relay_test_cancel.set()
+                self.relay_test_status_var.set("Запрошено выключение всех реле; ожидание ответа Arduino…")
+            return
+        if self.arduino_connecting or not self.arduino.ready:
+            self.relay_test_status_var.set("Сначала подключите Arduino и дождитесь READY.")
+            return
+        if not self.arduino.relay_capable or (pulse and not self.arduino.relay_selection_capable):
+            self.relay_test_status_var.set("Обновите прошивку Arduino: нужна поддержка реле и выбора каналов RELAY_MASK.")
+            return
+        mask = self._selected_relay_mask() if pulse else 3
+        self.relay_test_pending = True
+        self.relay_test_mode = self.operation_mode.get()
+        cancel_event = threading.Event()
+        self.relay_test_cancel = cancel_event
+        self.relay_test_status_var.set("Проверка: OFF → ON на 1 с → OFF…" if pulse else "Выключение всех реле…")
+        self._append_connection_log(f"{time.strftime('%H:%M:%S')}  RELAY TEST: {'pulse 1 s' if pulse else 'all OFF'}, mask={mask}.")
+        self._update_operation_mode_controls()
+        threading.Thread(target=self._run_relay_test, args=(mask, pulse, cancel_event), daemon=True).start()
+
+    def _run_relay_test(self, mask: int, pulse: bool, cancel_event: threading.Event) -> None:
+        controller = ArduinoValveController(self.arduino, self.events, mask)
+        error = None
+        try:
+            if pulse:
+                controller.set_switched(False, 0)
+                if not cancel_event.is_set():
+                    controller.set_switched(True, 0)
+                    cancel_event.wait(1.0)
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            try:
+                # Always request OFF, including after ON failed or was cancelled.
+                controller.set_switched(False, 0)
+            except Exception as exc:
+                detail = f"Не подтверждено выключение реле: {exc}"
+                error = f"{error}; {detail}" if error else detail
+            self.events.put(("relay_test_finished", (pulse, cancel_event.is_set(), error)))
+
+    def _request_manual_valve(self, switched: bool) -> None:
+        if self.operation_mode.get() != "manual" or (self.runner and self.runner.is_alive()):
+            self.manual_valve_status_var.set("Управление клапаном доступно только в ручном режиме без эксперимента.")
+            return
+        if self.manual_valve_pending:
+            if not switched and self.manual_valve_cancel is not None:
+                self.manual_valve_cancel.set()
+                self.manual_valve_status_var.set("Запрошен OFF после текущей команды; ожидание ответа Arduino…")
+            return
+        if self.relay_test_pending:
+            if not switched:
+                self._request_relay_test(False)
+            return
+        if self.arduino_connecting or not self.arduino.ready:
+            self.manual_valve_status_var.set("Сначала подключите Arduino и дождитесь READY.")
+            return
+        if not self.arduino.relay_capable or (switched and not self.arduino.relay_selection_capable):
+            self.manual_valve_status_var.set("Нужна основная прошивка Arduino TTL + реле с поддержкой RELAY_MASK.")
+            return
+        if switched and self.manual_valve_requires_off:
+            self.manual_valve_status_var.set("Сначала отправьте OFF и дождитесь подтверждения.")
+            return
+        mask = self._selected_relay_mask() if switched else 3
+        self.manual_valve_pending = True
+        # Only a confirmed OFF clears this interlock, not reconnect/READY.
+        self.manual_valve_requires_off = True
+        cancel = threading.Event()
+        self.manual_valve_cancel = cancel
+        self.manual_valve_status_var.set("Отправка ON выбранным реле…" if switched else "Отправка OFF обоим реле…")
+        self._append_connection_log(f"{time.strftime('%H:%M:%S')}  MANUAL VALVES: {'ON' if switched else 'OFF'}, mask={mask}.")
+        self._update_operation_mode_controls()
+        threading.Thread(target=self._run_manual_valve, args=(switched, mask, cancel), daemon=True).start()
+
+    def _run_manual_valve(self, switched: bool, mask: int, cancel: threading.Event) -> None:
+        error = None
+        try:
+            if switched and cancel.is_set():
+                ArduinoValveController(self.arduino, self.events, 3).set_switched(False, 0)
+            else:
+                ArduinoValveController(self.arduino, self.events, mask).set_switched(switched, 0)
+                if switched and cancel.is_set():
+                    ArduinoValveController(self.arduino, self.events, 3).set_switched(False, 0)
+        except Exception as exc:
+            error = str(exc)
+            if switched:
+                try:
+                    ArduinoValveController(self.arduino, self.events, 3).set_switched(False, 0)
+                except Exception as cleanup_exc:
+                    error += f"; OFF не подтверждён: {cleanup_exc}"
+        finally:
+            self.events.put(("manual_valve_finished", error))
+
     def _update_design_summary(self) -> None:
+        self.relay_cycle_hint_var.set(self._relay_cycle_description())
+        if self.plan_mode_var.get() == "custom":
+            flows = " ".join(self.custom_flows_var.get().split())
+            flow_summary = "Список потоков: " + (flows[:85] + "…" if len(flows) > 85 else flows or "не задан")
+        else:
+            flow_summary = f"Поток: {self.plan_vars['start'].get()} → {self.plan_vars['stop'].get()}, шаг {self.plan_vars['step'].get()}"
         self.design_summary_var.set(
-            f"Поток: {self.plan_vars['start'].get()} → {self.plan_vars['stop'].get()}, шаг {self.plan_vars['step'].get()}\n"
+            flow_summary + f" · повтор каждой точки ×{self.point_repeats_var.get()}\n"
             + " · ".join(f"{key} = {var.get()} с" for key, var in self.cycle_vars.items())
             + "\nДва спектра на точку; время записи добавляется к задержкам."
+            + "\n" + RELAY_SELECTION_LABELS.get(self.relay_selection_var.get(), "Выберите реле")
+            + "\n" + self._relay_cycle_description()
+            + (f"\nВосстановление Arduino на t1/t4/OFF: {self.recovery_attempts_var.get()} попыток на цикл, пауза перед каждой {self.recovery_interval_var.get()} с."
+               if self.recover_after_off_var.get() else "")
         )
 
     def _design_changed(self, *_args) -> None:
@@ -1112,14 +1590,32 @@ class GasLineApp(tk.Tk):
             cycle = self._current_cycle()
             # Saving the design does not require connected devices.
             self._current_plan(single_mfc=len(self.devices) <= 1)
-            settings = {key: float(self.plan_vars[key].get().replace(",", ".")) for key in ("start", "stop", "step", "ratio")}
-            if not math.isfinite(settings["ratio"]) or settings["ratio"] <= 0:
-                raise ValueError("Соотношение H₂ : алкен должно быть больше нуля")
+            settings: dict[str, Any] = {
+                "plan_mode": self.plan_mode_var.get(), "custom_flows": self.custom_flows_var.get(),
+                "point_repeats": self._current_point_repeats(),
+            }
+            # Inactive fields must not invalidate a custom plan or one-MFC run.
+            # Preserve their text so switching back never silently changes it.
+            for key in ("start", "stop", "step", "ratio"):
+                text = self.plan_vars[key].get()
+                try:
+                    value = float(text.replace(",", "."))
+                    settings[key] = value if math.isfinite(value) else text
+                except ValueError:
+                    settings[key] = text
             settings.update({key: getattr(cycle, key) for key in CYCLE_DEFAULTS})
+            settings["relay_mask"] = self._selected_relay_mask()
+            settings["relay_initial_on"] = self.relay_initial_on_var.get()
+            settings["recover_after_off"] = self.recover_after_off_var.get()
+            recovery_policy = self._current_recovery_policy()
+            settings["recovery_attempts"] = recovery_policy.attempts
+            settings["recovery_interval_s"] = recovery_policy.interval_s
             self.store.save_experiment(settings)
             self.design_status_var.set("Дизайн сохранён в конфигурации. Перед запуском план проверяется по подключённым MFC.")
+            self.status_var.set("Настройки сохранены: " + RELAY_SELECTION_LABELS[str(settings["relay_mask"])])
         except Exception as exc:
             self.design_status_var.set("Не удалось сохранить дизайн: " + str(exc))
+            self.status_var.set(self.design_status_var.get())
 
     def _update_available_ports(self) -> None:
         ports = sorted(
@@ -1130,6 +1626,7 @@ class GasLineApp(tk.Tk):
         if self.available_port_var.get() not in ports:
             self.available_port_var.set(ports[0] if ports else "")
         self.arduino_port_box["values"] = ports
+        self.manual_arduino_port_box["values"] = ports
         if self.arduino_port_var.get() not in ports:
             self.arduino_port_var.set(ports[0] if ports else "")
 
@@ -1139,6 +1636,15 @@ class GasLineApp(tk.Tk):
             self.after(2000, self._refresh_available_ports)
 
     def _operation_mode_changed(self) -> None:
+        if self.manual_valve_pending or (self.manual_valve_requires_off and self.operation_mode.get() != "manual"):
+            self.operation_mode.set("manual")
+            self.manual_valve_status_var.set("Перед сменой режима выключите реле и дождитесь подтверждения OFF.")
+            self._update_operation_mode_controls()
+            return
+        if self.relay_test_pending:
+            self.operation_mode.set(self.relay_test_mode)
+            self._update_operation_mode_controls()
+            return
         if self.runner and self.runner.is_alive():
             self.operation_mode.set("automatic-arduino-valves" if self.runner.valves is not None else "automatic-arduino")
             messagebox.showwarning("Эксперимент выполняется", "Остановите эксперимент перед переходом к ручному управлению.")
@@ -1157,6 +1663,37 @@ class GasLineApp(tk.Tk):
         arduino_mode = automatic
         valves_mode = self.operation_mode.get() == "automatic-arduino-valves"
         running = bool(self.runner and self.runner.is_alive())
+        busy = running or self.relay_test_pending or self.manual_valve_pending
+        selection_locked = busy or self.manual_valve_requires_off
+        self.relay_selection_box.configure(state="disabled" if selection_locked else "readonly")
+        self.manual_relay_selection_box.configure(state="disabled" if selection_locked else "readonly")
+        self.save_relay_selection_button.configure(state="disabled" if busy else "normal")
+        self.relay_initial_on_checkbutton.configure(state="normal" if valves_mode and not busy else "disabled")
+        if getattr(self.cycle_diagram, "relay_initial_on", False) != self.relay_initial_on_var.get():
+            self.cycle_diagram.relay_initial_on = self.relay_initial_on_var.get()
+            self.cycle_diagram.redraw()
+        self.recovery_checkbutton.configure(state="normal" if valves_mode and not busy else "disabled")
+        for entry in self.recovery_setting_entries:
+            entry.configure(state="normal" if valves_mode and not busy else "disabled")
+        can_test = self.arduino.ready and self.arduino.relay_selection_capable and not self.arduino_connecting and not busy and not self.manual_valve_requires_off
+        self.relay_test_button.configure(state="normal" if can_test else "disabled")
+        can_off = not running and (self.relay_test_pending or (
+            self.arduino.ready and self.arduino.relay_capable and not self.arduino_connecting))
+        self.relay_off_button.configure(state="normal" if can_off else "disabled")
+        manual_ready = not automatic and not running and not self.arduino_connecting and self.arduino.ready
+        can_manual_on = manual_ready and self.arduino.relay_capable and self.arduino.relay_selection_capable and not busy and not self.manual_valve_requires_off
+        self.manual_valve_on_button.configure(state="normal" if can_manual_on else "disabled")
+        self.manual_valve_off_button.configure(state="normal" if manual_ready and self.arduino.relay_capable else "disabled")
+        self.manual_arduino_connect_button.configure(state="disabled" if busy or self.arduino_connecting or (self.manual_valve_requires_off and self.arduino.ready) else "normal")
+        self.manual_arduino_disconnect_button.configure(state="disabled" if busy or self.arduino_connecting or self.manual_valve_requires_off else "normal")
+        self.manual_arduino_port_box.configure(state="disabled" if busy or self.arduino_connecting else "readonly")
+        relay_mask = self._selected_relay_mask()
+        self.cycle_diagram.relay_label = RELAY_SELECTION_LABELS[str(relay_mask)]
+        self.relay_wiring_var.set({
+            1: "D4 → IN1 переключается; D5 → IN2 всегда HIGH (OFF).",
+            2: "D5 → IN2 переключается; D4 → IN1 всегда HIGH (OFF).",
+            3: "D4 → IN1 и D5 → IN2 переключаются вместе.",
+        }[relay_mask] + " LOW = ON, HIGH = OFF.")
         if running:
             topology = "single" if self.plan_alkene_serial is None else "pair"
         elif not self.devices:
@@ -1171,16 +1708,17 @@ class GasLineApp(tk.Tk):
         single_mfc = topology in {"none", "single"}
         layout = (automatic, valves_mode, topology)
         if getattr(self, "_mode_layout", None) != layout:
-            for frame in (self.arduino_frame, self.plan_view_frame, self.manual_frame):
+            for frame in (self.arduino_frame, self.plan_view_frame, self.manual_frame, self.manual_valve_frame):
                 frame.pack_forget()
             if automatic:
                 self.experiment_columns.pack(fill="both", expand=True, before=self.recent_events_frame)
                 if arduino_mode:
-                    self.arduino_frame.pack(fill="x", pady=(0, 8))
+                    self.arduino_frame.pack(fill="x", pady=(0, 10), before=self.design_summary_frame)
                 self.plan_view_frame.pack(fill="x", pady=(0, 8))
                 self.auto_controls.pack(fill="x", before=self.progress_label)
             else:
                 self.experiment_columns.pack_forget()
+                self.manual_valve_frame.pack(fill="x", pady=(0, 8), before=self.recent_events_frame)
                 self.manual_frame.pack(fill="x", pady=(0, 8), before=self.recent_events_frame)
                 self.auto_controls.pack_forget()
             self._mode_layout = layout
@@ -1195,32 +1733,44 @@ class GasLineApp(tk.Tk):
             "pair": "План подачи газа · смесь H₂ / алкен",
         }[topology]
         self.plan_frame.configure(text=plan_title)
+        custom = self.plan_mode_var.get() == "custom"
+        self.plan_mode_box.configure(state="disabled" if running else "readonly")
+        for key in ("start", "stop", "step"):
+            for widget in (self.plan_field_labels[key], self.plan_field_entries[key]):
+                widget.grid_remove() if custom else widget.grid()
+        for widget in (self.custom_flows_label, self.custom_flows_entry, self.custom_flows_note):
+            widget.grid() if custom else widget.grid_remove()
         for widget in self.plan_input_widgets:
             enabled = not running and not (single_mfc and widget is self.plan_field_entries["ratio"])
+            if custom and widget in tuple(self.plan_field_entries[key] for key in ("start", "stop", "step")):
+                enabled = False
+            if widget is self.custom_flows_entry and not custom:
+                enabled = False
             widget.configure(state="normal" if enabled else "disabled")
         self.validate_plan_button.configure(state="normal" if bool(self.devices) and not running else "disabled")
         self.save_design_button.configure(state="disabled" if running else "normal")
-        self.start_experiment_button.configure(state="normal" if automatic and self.devices and not running else "disabled")
+        self.start_experiment_button.configure(state="normal" if automatic and self.devices and not busy and not self.manual_valve_requires_off else "disabled")
         self.stop_experiment_button.configure(state="normal" if automatic and running else "disabled")
         for button in self.mode_buttons:
-            button.configure(state="disabled" if running else "normal")
+            button.configure(state="disabled" if busy else "normal")
         for serial_number, card in self.manual_cards.items():
             card.set_enabled(not automatic and self.device_modes.get(serial_number, "Read flow") == "Set flow"
                              and serial_number not in self.manual_commands_pending)
         units = sorted({device.unit for device in self.devices.values()})
         self.plan_unit_var.set("Поток: " + " / ".join(units) if units else "Единицы потока появятся после подключения MFC.")
         if automatic:
-            base = "Весь поток подаётся одним MFC." if single_mfc else "Общий поток делится между H₂ и алкеном в заданном соотношении."
+            base = "Один MFC — весь заданный поток." if single_mfc else "Смесь H₂ / алкен в заданном соотношении."
             if topology == "none":
-                base = "Arduino подключается отдельно: сначала подключите хотя бы один MFC на вкладке «Подключение»."
-            detail = "Два спектра на точку с подтверждением TTL; задержки t1–t4 задаются в окне дизайна."
+                base = "Для опыта сначала подключите хотя бы один MFC на вкладке «Подключение»."
+            detail = "Два спектра на точку · подтверждение TTL."
             if valves_mode:
-                detail += " После t2 оба реле включаются; после t4 возвращаются в OFF."
+                detail += " Реле переключаются по дизайну."
             self.operation_mode_hint.set(base + " " + detail)
         elif self.devices:
             self.operation_mode_hint.set("Введите поток у нужного прибора и нажмите «Установить». «Ноль» прекращает подачу через этот MFC.")
         else:
-            self.operation_mode_hint.set("Сначала подключите расходомер на вкладке «Подключение».")
+            self.operation_mode_hint.set("Реле доступны через Arduino без MFC. Для ручной подачи потока подключите расходомер на вкладке «Подключение».")
+        refresh_experiment_presentation(self, automatic=automatic, valves_mode=valves_mode)
 
     def _update_manual_cards(self) -> None:
         for serial_number in set(self.manual_cards) - self.devices.keys():
@@ -1242,29 +1792,66 @@ class GasLineApp(tk.Tk):
         elif not self.manual_empty_label.winfo_manager():
             self.manual_empty_label.pack(anchor="w")
 
+    def _console_line_visible(self, message: str) -> bool:
+        return not self.short_logs_var.get() or not is_console_detail(message)
+
+    def _visible_console_lines(self) -> list[str]:
+        return [message for message in self._connection_log_lines if self._console_line_visible(message)]
+
+    def _insert_console_line(self, message: str) -> None:
+        tag = "error" if any(word in message.lower() for word in ("error", "failed", "ошибк")) else "ttl" if "TTL" in message or "NMR_DONE" in message else ""
+        self.connection_log.insert("end", message + "\n", (tag,) if tag else ())
+
+    def _update_recent_console(self) -> None:
+        recent = []
+        for message in reversed(self._connection_log_lines):
+            if self._console_line_visible(message):
+                recent.append(message)
+                if len(recent) == 3:
+                    break
+        self.recent_log.configure(state="normal")
+        self.recent_log.delete("1.0", "end")
+        self.recent_log.insert("end", "\n".join(reversed(recent)))
+        self.recent_log.configure(state="disabled")
+
+    def _refresh_console(self, *_args) -> None:
+        # Switching the view never deletes the full diagnostic history.
+        at_bottom = self.connection_log.yview()[1] >= 0.99
+        position = self.connection_log.yview()[0]
+        self.connection_log.configure(state="normal")
+        self.connection_log.delete("1.0", "end")
+        for message in self._visible_console_lines():
+            self._insert_console_line(message)
+        self.connection_log.configure(state="disabled")
+        if at_bottom:
+            self.connection_log.see("end")
+        else:
+            self.connection_log.yview_moveto(position)
+        self.console_mode_var.set("Журнал · важные события" if self.short_logs_var.get() else "Журнал · все сообщения")
+        self._update_recent_console()
+
     def _append_connection_log(self, message: str) -> None:
         self._connection_log_lines.append(message)
         excess = max(0, len(self._connection_log_lines) - 2000)
+        removed = self._connection_log_lines[:excess]
         if excess:
             del self._connection_log_lines[:excess]
+        removed_rows = sum(line.count("\n") + 1 for line in removed if self._console_line_visible(line))
         at_bottom = self.connection_log.yview()[1] >= 0.99
         self.connection_log.configure(state="normal")
-        if excess:
-            self.connection_log.delete("1.0", f"{excess + 1}.0")
-        tag = "error" if any(word in message.lower() for word in ("error", "failed", "ошибк")) else "ttl" if "TTL" in message or "NMR_DONE" in message else ""
-        self.connection_log.insert("end", message + "\n", (tag,) if tag else ())
+        if removed_rows:
+            self.connection_log.delete("1.0", f"{removed_rows + 1}.0")
+        if self._console_line_visible(message):
+            self._insert_console_line(message)
         if at_bottom:
             self.connection_log.see("end")
         self.connection_log.configure(state="disabled")
-        self.recent_log.configure(state="normal")
-        self.recent_log.delete("1.0", "end")
-        self.recent_log.insert("end", "\n".join(self._connection_log_lines[-3:]))
-        self.recent_log.configure(state="disabled")
+        self._update_recent_console()
 
     def _copy_console(self) -> None:
         self.clipboard_clear()
-        self.clipboard_append("\n".join(self._connection_log_lines))
-        self.status_var.set("Журнал скопирован в буфер обмена.")
+        self.clipboard_append("\n".join(self._visible_console_lines()))
+        self.status_var.set(("Короткий" if self.short_logs_var.get() else "Полный") + " журнал скопирован в буфер обмена.")
 
     def _clear_console(self) -> None:
         self._connection_log_lines.clear()
@@ -1318,6 +1905,12 @@ class GasLineApp(tk.Tk):
         }
 
     def _connect_arduino(self) -> None:
+        if self.manual_valve_pending or (self.manual_valve_requires_off and self.arduino.ready):
+            self.manual_valve_status_var.set("Сначала выключите реле и дождитесь завершения ручной команды.")
+            return
+        if self.relay_test_pending:
+            self.relay_test_status_var.set("Дождитесь завершения проверки реле перед переподключением Arduino.")
+            return
         if self.runner and self.runner.is_alive():
             messagebox.showwarning("Эксперимент выполняется", "Остановите эксперимент перед сменой подключения Arduino.")
             return
@@ -1342,6 +1935,12 @@ class GasLineApp(tk.Tk):
             self.events.put(("arduino_connection_error", str(exc)))
 
     def _disconnect_arduino(self) -> None:
+        if self.manual_valve_pending or (self.manual_valve_requires_off and self.arduino.ready):
+            self.manual_valve_status_var.set("Сначала выключите реле и дождитесь подтверждения OFF.")
+            return
+        if self.relay_test_pending:
+            self.relay_test_status_var.set("Сначала завершите проверку кнопкой «Выключить все».")
+            return
         if self.runner and self.runner.is_alive():
             messagebox.showwarning("Эксперимент выполняется", "Остановите эксперимент перед отключением Arduino.")
             return
@@ -1712,9 +2311,11 @@ class GasLineApp(tk.Tk):
         if self.schedule_tree.exists(item):
             self.schedule_tree.set(item, "status", status)
         rows = self.schedule_tree.get_children()
-        done = sum(self.schedule_tree.set(row, "status") == "Завершена" for row in rows)
+        statuses = [self.schedule_tree.set(row, "status") for row in rows]
+        done = sum(status.startswith("Завершена") for status in statuses)
+        warnings = sum(status == "Завершена, t4 прервана" for status in statuses)
         self.run_progress.configure(value=100 * done / len(rows) if rows else 0)
-        self.completed_points_var.set(f"Завершено: {done} из {len(rows)}")
+        self.completed_points_var.set(f"Завершено: {done} из {len(rows)}" + (f"; t4 прервана: {warnings}" if warnings else ""))
 
     def _manual_flow_request(self, serial_number: str, flow: float) -> None:
         if self.operation_mode.get() != "manual":
@@ -1769,25 +2370,35 @@ class GasLineApp(tk.Tk):
             self.events.put(("manual_setpoint_error", (serial_number, str(exc))))
 
     def _current_plan(self, single_mfc: bool) -> list[ExperimentPoint]:
+        mode = self.plan_mode_var.get()
+        if mode not in ("range", "custom"):
+            raise ValueError("Выберите диапазон с шагом или список потоков")
+        repeats = self._current_point_repeats()
         try:
-            required = ("start", "stop", "step", "dwell") if single_mfc else ("start", "stop", "step", "ratio", "dwell")
+            required = ["dwell"] + ([] if single_mfc else ["ratio"])
+            if mode == "range":
+                required += ["start", "stop", "step"]
             values = {key: float(self.plan_vars[key].get().replace(",", ".")) for key in required}
         except ValueError as exc:
             raise ValueError("Параметры плана должны быть числами") from exc
-        if single_mfc:
-            return build_single_mfc_plan(values["start"], values["stop"], values["step"], values["dwell"])
-        return build_plan(values["start"], values["stop"], values["step"], values["ratio"], values["dwell"])
+        if mode == "custom":
+            plan = build_custom_plan(self.custom_flows_var.get(), values.get("ratio", 1.0), values["dwell"], single_mfc)
+        elif single_mfc:
+            plan = build_single_mfc_plan(values["start"], values["stop"], values["step"], values["dwell"])
+        else:
+            plan = build_plan(values["start"], values["stop"], values["step"], values["ratio"], values["dwell"])
+        return repeat_plan_points(plan, repeats)
 
     def _validate_plan(self) -> list[ExperimentPoint] | None:
         try:
             cycle = self._current_cycle()
             h2, alkene = self._experiment_devices()
             plan = self._current_plan(alkene is None)
-            last = plan[-1]
-            if alkene is None and last.total_flow > h2.capacity + 1e-7:
-                raise ValueError(f"Конечный поток превышает диапазон: {last.total_flow:.6g}/{h2.capacity:.6g} {h2.unit}")
-            if alkene is not None and (last.h2_flow > h2.capacity + 1e-7 or last.alkene_flow > alkene.capacity + 1e-7):
-                raise ValueError(f"Конечный поток превышает диапазон: H2 {last.h2_flow:.6g}/{h2.capacity:.6g}, alkene {last.alkene_flow:.6g}/{alkene.capacity:.6g} {h2.unit}")
+            for point in plan:
+                if alkene is None and point.total_flow > h2.capacity + 1e-7:
+                    raise ValueError(f"Точка {point.number}: поток превышает диапазон: {point.total_flow:.6g}/{h2.capacity:.6g} {h2.unit}")
+                if alkene is not None and (point.h2_flow > h2.capacity + 1e-7 or point.alkene_flow > alkene.capacity + 1e-7):
+                    raise ValueError(f"Точка {point.number}: поток превышает диапазон: H2 {point.h2_flow:.6g}/{h2.capacity:.6g}, alkene {point.alkene_flow:.6g}/{alkene.capacity:.6g} {h2.unit}")
             seconds = len(plan) * cycle.delay_s
             self._show_plan(plan, h2, alkene)
             self.plan_var.set(f"{len(plan)} точек · {len(plan) * 2} спектров · {seconds:g} с задержек + время ЯМР\nДиапазон потока проверен.")
@@ -1801,6 +2412,12 @@ class GasLineApp(tk.Tk):
             self.control_enabled.set(False)
 
     def _start_experiment(self) -> None:
+        if self.manual_valve_pending or self.manual_valve_requires_off:
+            self.manual_valve_status_var.set("Перед запуском эксперимента выключите реле и дождитесь подтверждения OFF.")
+            return
+        if self.relay_test_pending:
+            self.relay_test_status_var.set("Дождитесь завершения проверки и подтверждения OFF перед запуском.")
+            return
         if self.operation_mode.get() not in AUTOMATIC_MODES:
             messagebox.showinfo("Ручной режим", "Выберите «Авто + ЯМР» или «Авто + ЯМР + клапаны».")
             return
@@ -1817,6 +2434,13 @@ class GasLineApp(tk.Tk):
         arduino_mode = self.operation_mode.get() in AUTOMATIC_MODES
         valves_mode = self.operation_mode.get() == "automatic-arduino-valves"
         cycle = self._current_cycle()
+        recovery_policy = None
+        if valves_mode and self.recover_after_off_var.get():
+            try:
+                recovery_policy = self._current_recovery_policy()
+            except ValueError as exc:
+                messagebox.showwarning("Восстановление Arduino", str(exc))
+                return
         timeout_s = 180.0
         if arduino_mode:
             if not self.arduino.ready:
@@ -1835,12 +2459,16 @@ class GasLineApp(tk.Tk):
                 return
             timeout_s = arduino_settings["spectrum_timeout_s"]
         extra = "\nВ каждой точке записываются два спектра, каждый с ответным TTL от ЯМР."
+        source = "список потоков" if self.plan_mode_var.get() == "custom" else "диапазон с шагом"
+        extra += f"\nПлан: {source}; повтор каждой точки ×{self.point_repeats_var.get()}; всего {len(plan) * 2} спектров."
         extra += f"\nt1={cycle.t1:g}, t2={cycle.t2:g}, t3={cycle.t3:g}, t4={cycle.t4:g} с."
         if valves_mode:
-            if not self.arduino.relay_capable:
-                messagebox.showwarning("Обновите прошивку Arduino", "Загрузите arduino_nmr_ttl.ino с поддержкой реле D4/D5 и подключите Arduino заново.")
+            if not self.arduino.relay_selection_capable:
+                messagebox.showwarning("Обновите прошивку Arduino", "Загрузите arduino_nmr_ttl.ino с выбором одного/двух реле (RELAY_MASK) и подключите Arduino заново.")
                 return
-            extra += "\nD4/D5 управляют двумя реле: после t2 питание обеих катушек включается, после t4 выключается."
+            extra += "\n" + RELAY_SELECTION_LABELS[str(self._selected_relay_mask())] + ": " + self._relay_cycle_description()
+            if self.recover_after_off_var.get():
+                extra += f"\nАвтовосстановление на t1/t4/OFF: {recovery_policy.attempts} попыток на каждый цикл, пауза {recovery_policy.interval_s:g} с перед каждой, включая первую. t1 начинается заново с начальным состоянием реле; прерванная t4 помечается предупреждением, до следующей точки реле остаются OFF."
         if alkene is None:
             prompt = (
                 f"Запустить {len(plan)} точек на MFC {h2.serial_number}?\n"
@@ -1858,7 +2486,10 @@ class GasLineApp(tk.Tk):
             arduino=self.arduino if arduino_mode else None,
             arduino_timeout_s=timeout_s,
             cycle=cycle,
-            valves=ArduinoValveController(self.arduino, self.events) if valves_mode else None,
+            valves=ArduinoValveController(self.arduino, self.events, self._selected_relay_mask()) if valves_mode else None,
+            recover_after_off=valves_mode and self.recover_after_off_var.get(),
+            recovery_policy=recovery_policy,
+            relay_initial_on=valves_mode and self.relay_initial_on_var.get(),
         )
         self.runner.start()
         self.progress_var.set("Запуск эксперимента…")
@@ -1924,16 +2555,54 @@ class GasLineApp(tk.Tk):
                     self.progress_var.set(f"Точка {point.number}: спектр {spectrum}/2 подтверждён ответным TTL.")
                     self._append_connection_log(f"{time.strftime('%H:%M:%S')}  POINT {point.number}: spectrum {spectrum}/2 confirmed by returning NMR TTL.")
                 elif kind == "valve_status":
-                    number, switched = payload
+                    number, switched, relay_mask = payload
                     if switched is None:
                         self.valve_status_var.set("Реле D4/D5: состояние не подтверждено.")
                     else:
-                        state = "ON: клапан 1 закрыт, клапан 2 открыт" if switched else "OFF: клапан 1 открыт, клапан 2 закрыт"
+                        if not switched:
+                            self.manual_valve_requires_off = False
+                        elif self.operation_mode.get() == "manual":
+                            self.manual_valve_requires_off = True
+                        r1 = "ON" if switched and relay_mask & 1 else "OFF"
+                        r2 = "ON" if switched and relay_mask & 2 else "OFF"
+                        state = f"D4/IN1={r1}, D5/IN2={r2}"
                         self.valve_status_var.set(f"Arduino подтвердила реле {state}.")
+                        if self.relay_test_pending:
+                            self.relay_test_status_var.set(f"Проверка: Arduino подтвердила {state}.")
                         self._append_connection_log(f"{time.strftime('%H:%M:%S')}  RELAYS · точка {number}: {state}; подтверждены выходы, датчиков положения клапанов нет.")
-                elif kind == "point_completed":
-                    self._point_status(payload.number, "Завершена")
-                    self.progress_var.set(f"Точка {payload.number}: цикл завершён. Переход к следующей точке.")
+                    self.manual_valve_status_var.set(self.valve_status_var.get())
+                elif kind == "manual_valve_finished":
+                    self.manual_valve_pending = False
+                    cancel = self.manual_valve_cancel
+                    self.manual_valve_cancel = None
+                    if payload:
+                        self.manual_valve_status_var.set("Ошибка управления реле: " + payload)
+                    elif cancel is not None and cancel.is_set() and self.manual_valve_requires_off:
+                        # OFF may be requested just after the worker checked the
+                        # event: do not lose that final UI cancellation race.
+                        self._request_manual_valve(False)
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  MANUAL VALVES: {self.manual_valve_status_var.get()}")
+                elif kind == "relay_test_finished":
+                    pulse, cancelled, error = payload
+                    self.relay_test_pending = False
+                    self.relay_test_cancel = None
+                    if error:
+                        text = "Ошибка проверки реле: " + error
+                    elif pulse:
+                        text = ("Проверка прервана" if cancelled else "Проверка завершена") + ": все реле OFF подтверждено. Проверьте щелчок/контакты."
+                    else:
+                        text = "Arduino подтвердила: все реле OFF (D4/D5 HIGH)."
+                    self.relay_test_status_var.set(text)
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  {text}")
+                elif kind in ("point_completed", "point_completed_warning"):
+                    warning = kind == "point_completed_warning"
+                    self._point_status(payload.number, "Завершена, t4 прервана" if warning else "Завершена")
+                    self.progress_var.set(f"Точка {payload.number}: " + ("оба спектра приняты, t4 прервана." if warning else "цикл завершён.") + " Переход к следующей точке.")
+                elif kind == "recovery_status":
+                    number, message = payload
+                    self._point_status(number, "Контроль OFF / восстановление")
+                    self.progress_var.set(f"Точка {number}: {message}")
+                    self._append_connection_log(f"{time.strftime('%H:%M:%S')}  RECOVERY · точка {number}: {message}")
                 elif kind == "finished":
                     self._append_connection_log(f"{time.strftime('%H:%M:%S')}  {payload}")
                     self.progress_var.set(payload)
@@ -1971,16 +2640,24 @@ class GasLineApp(tk.Tk):
                     self.arduino_settings = dict(payload)
                     if hasattr(self.store, "save_arduino"):
                         self.store.save_arduino(self.arduino_settings)
+                    self.relay_test_status_var.set(
+                        "Arduino готова. «Проверить реле» включит выбранные каналы на 1 с и выключит их."
+                        if self.arduino.relay_selection_capable else
+                        "Для проверки реле обновите прошивку Arduino до версии с RELAY_MASK.")
+                    self.manual_valve_status_var.set("Arduino готова. Выберите реле и нажмите ON или OFF; положение клапана не измеряется.")
                     self._append_connection_log(f"{time.strftime('%H:%M:%S')}  UI: Arduino connected on {payload['port']}.")
                 elif kind == "arduino_disconnected":
                     self.arduino_connecting = False
                     self.arduino_connect_button.configure(state="normal")
                     self.arduino_status_var.set("Arduino не подключена.")
+                    self.relay_test_status_var.set("Проверка реле: Arduino отключена.")
+                    self.manual_valve_status_var.set("Arduino отключена. Текущее состояние реле не подтверждено.")
                     self._append_connection_log(f"{time.strftime('%H:%M:%S')}  UI: Arduino disconnected.")
                 elif kind == "arduino_connection_error":
                     self.arduino_connecting = False
                     self.arduino_connect_button.configure(state="normal")
                     self.arduino_status_var.set("Ошибка подключения Arduino: " + payload)
+                    self.manual_valve_status_var.set("Ошибка подключения Arduino; состояние реле не подтверждено.")
                     self._append_connection_log(f"{time.strftime('%H:%M:%S')}  ARDUINO CONNECTION ERROR: {payload}")
                 elif kind == "manual_setpoint":
                     serial_number, flow = payload
@@ -2011,6 +2688,22 @@ class GasLineApp(tk.Tk):
             self.after(100, self._consume_events)
 
     def _close(self) -> None:
+        if self.manual_valve_pending:
+            if self.manual_valve_cancel is not None:
+                self.manual_valve_cancel.set()
+            self.manual_valve_status_var.set("Ожидание OFF перед закрытием…")
+            if not getattr(self, "_close_pending", False):
+                self._close_pending = True
+                self.after(100, self._retry_close)
+            return
+        if self.relay_test_pending:
+            if self.relay_test_cancel is not None:
+                self.relay_test_cancel.set()
+            self.relay_test_status_var.set("Выключение реле перед закрытием…")
+            if not getattr(self, "_close_pending", False):
+                self._close_pending = True
+                self.after(100, self._retry_close)
+            return
         if self.runner and self.runner.is_alive():
             self.runner.cancel()
             # Keep the two COM workers alive until the runner has sent OFF

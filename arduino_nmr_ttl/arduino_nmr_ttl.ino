@@ -8,12 +8,12 @@
     Arduino -> PC:  TRIGGERED <run-id> <point>
     NMR -> Arduino: rising TTL edge on NMR_DONE_PIN
     Arduino -> PC:  NMR_DONE <run-id> <point>
-    PC -> Arduino:  VALVES <token> ON|OFF
-    Arduino -> PC:  VALVES_ACK <token> ON|OFF
+    PC -> Arduino:  VALVES <token> ON|OFF <mask:1|2|3>
+    Arduino -> PC:  VALVES_ACK <token> ON|OFF <mask>
     PC -> Arduino:  KEEPALIVE (every second; host timeout 5 s)
 
   D4 -> IN1, D5 -> IN2. OFF (HIGH) removes 24V from both valve coils;
-  ON (LOW) powers both coils: valve 1 closes, valve 2 opens.
+  ON (LOW) powers selected coils only: mask 1=D4, 2=D5, 3=both.
 
   A new TRIGGER is rejected while the board is waiting for NMR_DONE.  A
   completion edge received before MIN_NMR_DELAY_MS is ignored, preventing the
@@ -80,10 +80,16 @@ bool discardLine = false;
 bool relaysOn = false;
 unsigned long lastHostMessage = 0;
 
-void setRelays(bool on) {
-  const uint8_t level = (on != RELAY_ACTIVE_LOW) ? HIGH : LOW;
-  digitalWrite(RELAY_1_PIN, level);
-  digitalWrite(RELAY_2_PIN, level);
+void setRelays(bool on, uint8_t mask) {
+  const uint8_t offLevel = RELAY_ACTIVE_LOW ? HIGH : LOW;
+  const uint8_t onLevel = RELAY_ACTIVE_LOW ? LOW : HIGH;
+  const bool on1 = on && (mask & 1);
+  const bool on2 = on && (mask & 2);
+  // Disable unselected outputs first, even when changing D4 <-> D5.
+  if (!on1) digitalWrite(RELAY_1_PIN, offLevel);
+  if (!on2) digitalWrite(RELAY_2_PIN, offLevel);
+  if (on1) digitalWrite(RELAY_1_PIN, onLevel);
+  if (on2) digitalWrite(RELAY_2_PIN, onLevel);
   relaysOn = on;
 }
 
@@ -169,7 +175,7 @@ void startTrigger(const char *runId, const char *pointText) {
 void abortTrigger(const char *runId, const char *pointText) {
   if (state == WAITING_FOR_NMR && strcmp(runId, activeRunId) == 0 && atol(pointText) == activePoint) {
     state = IDLE;
-    setRelays(false);
+    setRelays(false, 3);
     clearPendingNmrEdge();
     Serial.print(F("ABORTED "));
     Serial.print(runId);
@@ -199,7 +205,8 @@ void handleCommand(char *line) {
   char *runId = strtok(NULL, " \t");
   char *point = strtok(NULL, " \t");
   char *extra = strtok(NULL, " \t");
-  if (runId == NULL || point == NULL || extra != NULL) {
+  char *trailing = strtok(NULL, " \t");
+  if (runId == NULL || point == NULL || trailing != NULL) {
     printError(runId, point, "BAD_COMMAND_FORMAT");
     return;
   }
@@ -211,16 +218,34 @@ void handleCommand(char *line) {
       return;
     }
     const bool on = strcmp(point, "ON") == 0;
+    // Require an explicit mask for ON. A legacy GUI must not accidentally
+    // energize both relays. Legacy OFF is accepted for emergency cleanup.
+    if ((extra == NULL && on) || (extra != NULL &&
+        (strlen(extra) != 1 || extra[0] < '1' || extra[0] > '3'))) {
+      printError(runId, point, "RELAY_MASK_REQUIRED_1_2_3");
+      return;
+    }
+    const uint8_t mask = extra == NULL ? 3 : static_cast<uint8_t>(extra[0] - '0');
     if (on && state != IDLE) {
       printError(runId, point, "BUSY_WAITING_FOR_NMR_DONE");
       return;
     }
     lastHostMessage = millis();
-    setRelays(on);
+    setRelays(on, mask);
     Serial.print(F("VALVES_ACK "));
     Serial.print(runId);
     Serial.print(' ');
-    Serial.println(on ? F("ON") : F("OFF"));
+    Serial.print(on ? F("ON") : F("OFF"));
+    if (extra != NULL) {
+      Serial.print(' ');
+      Serial.print(mask);
+    }
+    Serial.println();
+    return;
+  }
+
+  if (extra != NULL) {
+    printError(runId, point, "BAD_COMMAND_FORMAT");
     return;
   }
 
@@ -295,7 +320,7 @@ void pollNmrCompletion() {
 
 void setup() {
   // Prime inactive HIGH output latches before enabling output drivers.
-  setRelays(false);
+  setRelays(false, 3);
   pinMode(RELAY_1_PIN, OUTPUT);
   pinMode(RELAY_2_PIN, OUTPUT);
   digitalWrite(NMR_TRIGGER_PIN, LOW);
@@ -318,6 +343,7 @@ void setup() {
   Serial.println();
 #endif
   Serial.println(F("CAPABILITIES NMR RELAYS_D4_D5"));
+  Serial.println(F("CAPABILITY RELAY_MASK"));
   Serial.println(F("READY"));
   lastHostMessage = millis();
 #if defined(__AVR__)
@@ -332,7 +358,7 @@ void loop() {
   pollSerial();
   pollNmrCompletion();
   if ((relaysOn || state != IDLE) && millis() - lastHostMessage >= HOST_TIMEOUT_MS) {
-    setRelays(false);
+    setRelays(false, 3);
     digitalWrite(NMR_TRIGGER_PIN, LOW);
     state = IDLE;
     clearPendingNmrEdge();
